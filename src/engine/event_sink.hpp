@@ -5,6 +5,7 @@
 #include <map>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace helix {
 
@@ -22,10 +23,13 @@ public:
     /* Called for each batch of safely-emittable content. */
     virtual void on_content(int choice_index, std::string_view delta) = 0;
 
-    /* Phase 6: per-token emission with logprob info (bypasses coalescing).
-     * Default implementation delegates to on_content (ignoring logprob). */
+    /* Phase 6: content emission carrying the logprob entries accrued since the
+     * last release (bypasses coalescing). Usually one entry per call, but the
+     * reasoning extractor's partial-tag lookahead can withhold bytes across
+     * steps, in which case several entries arrive with one content delta.
+     * Default implementation delegates to on_content (ignoring logprobs). */
     virtual void on_token_with_logprob(int choice_index, std::string_view piece,
-                                        const TokenLogprobEntry& /*info*/) {
+                                        const std::vector<TokenLogprobEntry>& /*infos*/) {
         on_content(choice_index, piece);
     }
 
@@ -174,12 +178,12 @@ public:
     }
 
     void on_token_with_logprob(int choice_index, std::string_view piece,
-                                const TokenLogprobEntry& info) override {
+                                const std::vector<TokenLogprobEntry>& infos) override {
         if (cancelled_) return;
         DeltaContent d;
         d.content = std::string(piece);
         ChoiceLogprobs lp;
-        lp.content.push_back(info);
+        lp.content = infos;
         emit(make_chunk_json(id_, created_, model_, fingerprint_, choice_index, d, "", &lp));
     }
 

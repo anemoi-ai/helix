@@ -261,6 +261,7 @@ static DecodeResult decode_one(Session& sess,
     bool cancelled = false;
     std::vector<llama_token> gen_tokens;
     std::vector<TokenLogprobEntry> logprob_entries;
+    std::vector<TokenLogprobEntry> lp_pending; /* entries awaiting content release */
     int tool_calls_started = 0;
 
     /* Whether this call is operating on a multimodal-prefilled context.
@@ -405,8 +406,12 @@ static DecodeResult decode_one(Session& sess,
         if (lp_cfg.enabled && !has_parser && lp_raw) {
             /* Per-token emission path (logprobs active on content-only path).
              * Route the newly emittable bytes through the reasoning extractor
-             * and attach this token's logprob entry to whatever content the
-             * extractor releases this step. */
+             * and attach every logprob entry accrued since the last release to
+             * whatever content the extractor releases this step. Entries are
+             * queued rather than dropped because the extractor's partial-tag
+             * lookahead (and stop-string holdback) can withhold a token's
+             * bytes until a later step — or until the final flush. */
+            lp_pending.push_back(lp_entry);
             size_t new_safe = valid_utf8_prefix_len(output.data(), output.size());
             size_t emit_len = new_safe - partial_stop_len(output, new_safe, stops);
             if (emit_len > emitted_up_to) {
@@ -418,7 +423,8 @@ static DecodeResult decode_one(Session& sess,
                     reasoning_text += rout.reasoning;
                 }
                 if (!rout.content.empty()) {
-                    sink.on_token_with_logprob(choice_index, rout.content, lp_entry);
+                    sink.on_token_with_logprob(choice_index, rout.content, lp_pending);
+                    lp_pending.clear();
                 }
                 emitted_up_to = emit_len;
             }
@@ -495,7 +501,19 @@ static DecodeResult decode_one(Session& sess,
             /* Fall through with whatever content the sink already received. */
         }
     } else if (!has_parser) {
-        /* Content-only: push remaining safe bytes through reasoning extractor, then flush. */
+        /* Content-only: push remaining safe bytes through reasoning extractor,
+         * then flush. Queued logprob entries ride on the first content release
+         * so short generations (fully held back by the extractor's lookahead)
+         * still deliver their logprobs. */
+        auto emit_content = [&](const std::string& content) {
+            if (content.empty()) return;
+            if (!lp_pending.empty()) {
+                sink.on_token_with_logprob(choice_index, content, lp_pending);
+                lp_pending.clear();
+            } else {
+                sink.on_content(choice_index, content);
+            }
+        };
         size_t final_safe = valid_utf8_prefix_len(output.data(), output.size());
         if (final_safe > emitted_up_to) {
             auto delta = std::string_view(output.data() + emitted_up_to,
@@ -505,7 +523,7 @@ static DecodeResult decode_one(Session& sess,
                 sink.on_reasoning_delta(choice_index, rout.reasoning);
                 reasoning_text += rout.reasoning;
             }
-            if (!rout.content.empty()) sink.on_content(choice_index, rout.content);
+            emit_content(rout.content);
         }
         /* Flush the lookahead buffer (partial tag text). */
         auto flush_rout = reasoning_ex.flush();
@@ -513,7 +531,7 @@ static DecodeResult decode_one(Session& sess,
             sink.on_reasoning_delta(choice_index, flush_rout.reasoning);
             reasoning_text += flush_rout.reasoning;
         }
-        if (!flush_rout.content.empty()) sink.on_content(choice_index, flush_rout.content);
+        emit_content(flush_rout.content);
 
         if (!reasoning_text.empty()) sink.on_reasoning_end(choice_index);
     }
@@ -629,6 +647,7 @@ static DecodeResult decode_one_speculative(Session& sess,
     bool cancelled = false;
     std::vector<llama_token> gen_tokens;
     std::vector<TokenLogprobEntry> logprob_entries;
+    std::vector<TokenLogprobEntry> lp_pending; /* entries awaiting content release */
     int tool_calls_started = 0;
 
     ReasoningExtractor reasoning_ex(rendered.extract_reasoning,
@@ -678,6 +697,8 @@ static DecodeResult decode_one_speculative(Session& sess,
          * hold back any output suffix that is a prefix of a stop string —
          * see decode_one for the rationale. */
         if (lp_cfg.enabled && !has_parser && tk_logits) {
+            /* Queue entries across withheld steps — see decode_one. */
+            lp_pending.push_back(lp_entry);
             size_t new_safe = valid_utf8_prefix_len(output.data(), output.size());
             size_t emit_len = new_safe - partial_stop_len(output, new_safe, stops);
             if (emit_len > emitted_up_to) {
@@ -688,8 +709,10 @@ static DecodeResult decode_one_speculative(Session& sess,
                     sink.on_reasoning_delta(choice_index, rout.reasoning);
                     reasoning_text += rout.reasoning;
                 }
-                if (!rout.content.empty())
-                    sink.on_token_with_logprob(choice_index, rout.content, lp_entry);
+                if (!rout.content.empty()) {
+                    sink.on_token_with_logprob(choice_index, rout.content, lp_pending);
+                    lp_pending.clear();
+                }
                 emitted_up_to = emit_len;
             }
             last_emit = std::chrono::steady_clock::now();
@@ -874,6 +897,16 @@ spec_done:
             log_warn("PEG final parse error: " + std::string(e.what()));
         }
     } else if (!has_parser) {
+        /* Queued logprob entries ride on the first content release — see decode_one. */
+        auto emit_content = [&](const std::string& content) {
+            if (content.empty()) return;
+            if (!lp_pending.empty()) {
+                sink.on_token_with_logprob(choice_index, content, lp_pending);
+                lp_pending.clear();
+            } else {
+                sink.on_content(choice_index, content);
+            }
+        };
         size_t final_safe = valid_utf8_prefix_len(output.data(), output.size());
         if (final_safe > emitted_up_to) {
             auto delta = std::string_view(output.data() + emitted_up_to,
@@ -883,14 +916,14 @@ spec_done:
                 sink.on_reasoning_delta(choice_index, rout.reasoning);
                 reasoning_text += rout.reasoning;
             }
-            if (!rout.content.empty()) sink.on_content(choice_index, rout.content);
+            emit_content(rout.content);
         }
         auto flush_rout = reasoning_ex.flush();
         if (!flush_rout.reasoning.empty()) {
             sink.on_reasoning_delta(choice_index, flush_rout.reasoning);
             reasoning_text += flush_rout.reasoning;
         }
-        if (!flush_rout.content.empty()) sink.on_content(choice_index, flush_rout.content);
+        emit_content(flush_rout.content);
         if (!reasoning_text.empty()) sink.on_reasoning_end(choice_index);
     }
 
@@ -1166,14 +1199,18 @@ helix_status_t run_chat_completions(Session& sess,
         : static_cast<EventSink&>(collect_sink);
 
     /* 9. Resolve response_format grammar (phase 6).
-     * When a PEG parser is present, skip response_format grammar too — the PEG parser
-     * handles output without grammar constraints to avoid conflicts with tool call output
-     * and <think> tokens on reasoning models (Qwen3.5, etc.). */
-    const bool skip_grammar = rendered.has_tools && !rendered.parser_data.empty();
+     * When a PEG parser is present (tools active), the tool grammar from the
+     * template — not response_format — owns the sampler: llama.cpp derives
+     * both the GBNF and the PEG parser from the same parse tree, so they
+     * agree by construction. The grammar is what makes tool_choice:"required"
+     * an actual guarantee (eager grammar) rather than a hint; for "auto" it
+     * is lazy and only engages at the tool-call trigger marker, leaving
+     * regular content and <think> output unconstrained. */
+    const bool has_peg = rendered.has_tools && !rendered.parser_data.empty();
     const llama_vocab* vocab = llama_model_get_vocab(sess.model().llama_model_ptr());
 
     std::string rf_grammar;
-    if (req.response_format && req.response_format->type != "text" && !skip_grammar) {
+    if (req.response_format && req.response_format->type != "text" && !has_peg) {
         ResponseFormatResolved rfs = resolve_response_format(
             req.response_format->type,
             req.response_format->json_schema,
@@ -1188,8 +1225,8 @@ helix_status_t run_chat_completions(Session& sess,
     std::vector<GrammarTrigger> sampler_triggers;
     if (!rf_grammar.empty()) {
         sampler_grammar = rf_grammar; /* eager — thinking disabled for rf requests */
-    } else if (!skip_grammar) {
-        sampler_grammar = rendered.grammar;
+    } else {
+        sampler_grammar = rendered.grammar; /* empty unless tools are active */
         sampler_grammar_lazy = rendered.grammar_lazy;
         sampler_triggers = rendered.grammar_triggers;
     }

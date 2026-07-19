@@ -154,8 +154,13 @@ TEST_F(HelixFixture, MaxTokensLength) {
 
 /* ---- Test 4: stop array ---- */
 TEST_F(HelixFixture, StopArray) {
+    /* Two paragraphs guarantee a blank line for the stop string to hit;
+     * temperature 0 keeps the outcome deterministic across CI runs (at 0.5
+     * the model occasionally rambled past max_tokens with no "\n\n" and no
+     * EOS, finishing with "length"). */
     std::string extras = "\"stop\":[\"\\n\\n\"]";
-    auto j = run(req("Write a short paragraph about cats.", 128, 0.5f, 1, extras));
+    auto j = run(req("Write two short paragraphs about cats, separated by a blank line.",
+                     256, 0.0f, 1, extras));
     std::string content = j["choices"][0]["message"]["content"].get<std::string>();
     EXPECT_EQ(content.find("\n\n"), std::string::npos)
         << "stop string should have been applied";
