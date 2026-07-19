@@ -95,13 +95,41 @@ jobs:
           sudo ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
           echo "/usr/local/cuda/bin" >> $GITHUB_PATH
           echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+      # The NVIDIA installer crashes deterministically on hosted runners
+      # (exit 3772776473, two runs in a row), so install from NVIDIA's redist
+      # zip archives instead — mirrors llama.cpp's windows-setup-cuda action
+      # (same 12.4 package set) — and register the CUDA MSBuild integration
+      # that the Visual Studio generator needs.
       - name: Install CUDA Toolkit (Windows, CUDA backend)
         if: matrix.backend == 'cuda' && runner.os == 'Windows'
-        uses: Jimver/cuda-toolkit@v0.2.21
-        with:
-          cuda: '12.6.2'
-          method: 'network'
-          sub-packages: '["nvcc", "cudart", "cudart_dev", "cublas", "cublas_dev", "visual_studio_integration"]'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $cuda = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
+          New-Item -ItemType Directory -Force $cuda | Out-Null
+          $pkgs = @(
+            "cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.4.127-archive.zip",
+            "cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-12.4.131-archive.zip",
+            "cuda_nvrtc/windows-x86_64/cuda_nvrtc-windows-x86_64-12.4.127-archive.zip",
+            "libcublas/windows-x86_64/libcublas-windows-x86_64-12.4.5.8-archive.zip",
+            "cuda_nvtx/windows-x86_64/cuda_nvtx-windows-x86_64-12.4.127-archive.zip",
+            "cuda_profiler_api/windows-x86_64/cuda_profiler_api-windows-x86_64-12.4.127-archive.zip",
+            "visual_studio_integration/windows-x86_64/visual_studio_integration-windows-x86_64-12.4.127-archive.zip",
+            "cuda_cccl/windows-x86_64/cuda_cccl-windows-x86_64-12.4.127-archive.zip"
+          )
+          foreach ($p in $pkgs) {
+            $zip = Join-Path $env:RUNNER_TEMP (Split-Path $p -Leaf)
+            curl.exe -fsSL -o $zip "https://developer.download.nvidia.com/compute/cuda/redist/$p"
+            Expand-Archive $zip -DestinationPath "$env:RUNNER_TEMP\cuda-extract" -Force
+          }
+          Get-ChildItem "$env:RUNNER_TEMP\cuda-extract" -Directory | ForEach-Object {
+            Copy-Item "$($_.FullName)\*" $cuda -Recurse -Force
+          }
+          $bc = (Resolve-Path "C:\Program Files\Microsoft Visual Studio\2022\*\MSBuild\Microsoft\VC\v170\BuildCustomizations" | Select-Object -First 1).Path
+          Copy-Item "$cuda\visual_studio_integration\MSBuildExtensions\*" $bc -Force
+          Add-Content $env:GITHUB_ENV "CUDA_PATH=$cuda"
+          Add-Content $env:GITHUB_ENV "CUDA_PATH_V12_4=$cuda"
+          Add-Content $env:GITHUB_PATH "$cuda\bin"
       # ggml-vulkan does find_package(SPIRV-Headers) via $ENV{VULKAN_SDK}; the
       # full LunarG SDK ships that CMake package (the humbletim action's
       # minimal install does not). Mirrors llama.cpp's own release workflow.
