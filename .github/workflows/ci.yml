@@ -45,20 +45,25 @@ jobs:
           submodules: recursive
 
       # ---- Model cache (shared across platforms) ----
+      # The integration tests assert on visible content ("pong", French reply,
+      # streamed deltas). Qwen3-family models think by default: a small model
+      # spends the whole max_tokens budget inside <think>, everything routes to
+      # reasoning_content, and content-asserting tests fail. Use the
+      # non-thinking instruct model the suite was written for.
       - name: Cache test model
         id: model-cache
         uses: actions/cache@v4
         with:
-          path: Qwen3.5-0.8B-Q4_K_M.gguf
-          key: qwen3.5-0.8b-q4_k_m-gguf
+          path: qwen2.5-0.5b-instruct-q4_k_m.gguf
+          key: qwen2.5-0.5b-instruct-q4_k_m-gguf
 
       - name: Download test model
         if: steps.model-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           curl -fsSL \
-            -o Qwen3.5-0.8B-Q4_K_M.gguf \
-            "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf?download=true"
+            -o qwen2.5-0.5b-instruct-q4_k_m.gguf \
+            "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf?download=true"
 
       - name: Cache embedding model download
         id: embed-model-cache
@@ -83,8 +88,13 @@ jobs:
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update -q
           sudo apt-get install -y cuda-toolkit-12-6
+          # Hosted runners have no NVIDIA driver, so nothing provides
+          # libcuda.so.1 — which gtest_discover_tests needs just to load the
+          # test binary at build time. The toolkit's stub satisfies the loader;
+          # CUDA init then fails at runtime and helix falls back to CPU.
+          sudo ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
           echo "/usr/local/cuda/bin" >> $GITHUB_PATH
-          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH" >> $GITHUB_ENV
       - name: Install CUDA Toolkit (Windows, CUDA backend)
         if: matrix.backend == 'cuda' && runner.os == 'Windows'
         uses: Jimver/cuda-toolkit@v0.2.21
@@ -92,11 +102,19 @@ jobs:
           cuda: '12.6.2'
           method: 'network'
           sub-packages: '["nvcc", "cudart", "cudart_dev", "cublas", "cublas_dev", "visual_studio_integration"]'
+      # ggml-vulkan does find_package(SPIRV-Headers) via $ENV{VULKAN_SDK}; the
+      # full LunarG SDK ships that CMake package (the humbletim action's
+      # minimal install does not). Mirrors llama.cpp's own release workflow.
       - name: Install Vulkan SDK (Windows, Vulkan backend)
         if: matrix.backend == 'vulkan' && runner.os == 'Windows'
-        uses: humbletim/install-vulkan-sdk@v1.2
-        with:
-          version: '1.3.296.0'
+        shell: pwsh
+        env:
+          VULKAN_VERSION: 1.4.313.2
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
 
       # ---- Configure ----
       - name: Configure (Linux)
@@ -144,7 +162,7 @@ jobs:
         run: |
           ./build/tests/helix_integration_tests
         env:
-          HELIX_TEST_MODEL: "${{ github.workspace }}/Qwen3.5-0.8B-Q4_K_M.gguf"
+          HELIX_TEST_MODEL: "${{ github.workspace }}/qwen2.5-0.5b-instruct-q4_k_m.gguf"
           HELIX_TEST_EMBED_MODEL: "${{ github.workspace }}/nomic-embed-text-v1.5.Q8_0.gguf"
       - name: Integration tests (Windows)
         if: matrix.run_integration && runner.os == 'Windows'
@@ -152,7 +170,7 @@ jobs:
           .\build\bin\Release\helix_integration_tests.exe
         shell: cmd
         env:
-          HELIX_TEST_MODEL: '${{ github.workspace }}\Qwen3.5-0.8B-Q4_K_M.gguf'
+          HELIX_TEST_MODEL: '${{ github.workspace }}\qwen2.5-0.5b-instruct-q4_k_m.gguf'
           HELIX_TEST_EMBED_MODEL: '${{ github.workspace }}\nomic-embed-text-v1.5.Q8_0.gguf'
 
       - name: Upload test results
