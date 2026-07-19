@@ -1,0 +1,5 @@
+usr/include/helix.h
+usr/lib/*/libhelix.a
+usr/lib/*/libhelix.so
+usr/lib/*/cmake/helix/
+usr/lib/*/pkgconfig/helix.pc

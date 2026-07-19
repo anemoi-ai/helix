@@ -1,0 +1,15 @@
+[package]
+name = "helix-sys"
+version = "1.0.0"
+edition = "2021"
+description = "Raw FFI bindings for libhelix"
+license = "MIT"
+repository = "https://github.com/anemoi-ai/rust"
+links = "helix"
+
+[build-dependencies]
+bindgen = "0.72"
+
+[features]
+# Download and bundle a prebuilt libhelix (not yet implemented; requires helix CI artifacts)
+bundled = []

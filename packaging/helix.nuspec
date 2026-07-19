@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>helix</id>
+    <version>1.0.0</version>
+    <packageSourceUrl>https://github.com/anemoi-ai/helix</packageSourceUrl>
+    <owners>Anemoi AI</owners>
+    <title>Helix — On-Device LLM Library</title>
+    <authors>Anemoi AI</authors>
+    <projectUrl>https://github.com/anemoi-ai/helix</projectUrl>
+    <licenseUrl>https://github.com/anemoi-ai/helix/blob/main/LICENSE</licenseUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <projectSourceUrl>https://github.com/anemoi-ai/helix</projectSourceUrl>
+    <bugTrackerUrl>https://github.com/anemoi-ai/helix/issues</bugTrackerUrl>
+    <tags>llm inference ai local cpp library</tags>
+    <summary>OpenAI-isomorphic on-device LLM inference library</summary>
+    <description>Helix is a single C/C++ shared library (helix.dll) that transforms any GGUF model
+into a fully in-process, OpenAI Chat Completions-compatible LLM endpoint.
+No subprocesses. No open ports. No network calls.
+
+Installs helix.dll, helix-doctor.exe, and helix.h to %ProgramFiles%\Helix\.
+    </description>
+    <releaseNotes>https://github.com/anemoi-ai/helix/blob/main/RELEASE-NOTES-1.0.md</releaseNotes>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+  </files>
+</package>

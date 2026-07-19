@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>CS1591</NoWarn>
+    <PackageId>Helix.Net</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>Helix Authors</Authors>
+    <Description>Helix.Net — .NET wrapper for libhelix local LLM inference</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/anemoi-ai/dotnet</RepositoryUrl>
+    <Optimize>true</Optimize>
+  </PropertyGroup>
+
+  <!-- Native binary packaging: runtimes/{rid}/native/ layout -->
+  <ItemGroup>
+    <None Include="runtimes/**" Pack="true" PackagePath="runtimes" />
+  </ItemGroup>
+</Project>

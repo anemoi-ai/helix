@@ -1,0 +1,9 @@
+helix (1.0.0-1) unstable; urgency=medium
+
+  * Initial release. GA 1.0.0 — ABI frozen for 18 months.
+  * 16-symbol C ABI with OpenAI Chat Completions semantics.
+  * CPU, CUDA, Metal, Vulkan, ROCm, and omni backends.
+  * Streaming, tool calling, structured outputs, multimodal, reasoning.
+  * Language wrappers for Python, Rust, Swift, Node, Go, .NET.
+
+ -- Helix Team <anemoi_ai@proton.me>  Sun, 31 May 2026 12:00:00 +0000

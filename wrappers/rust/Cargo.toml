@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "helix-sys",
+    "helix",
+]
+resolver = "2"

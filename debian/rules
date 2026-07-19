@@ -1,0 +1,17 @@
+#!/usr/bin/make -f
+export DH_VERBOSE = 1
+
+%:
+	dh $@ --buildsystem=cmake
+
+override_dh_auto_configure:
+	dh_auto_configure -- \
+		-DHELIX_BACKEND=cpu \
+		-DHELIX_BUILD_TESTS=OFF \
+		-DCMAKE_BUILD_TYPE=Release
+
+override_dh_install:
+	dh_install
+	# Move the .so symlink to -dev only
+	mv debian/libhelix1/usr/lib/*/libhelix.so \
+	   debian/libhelix-dev/usr/lib/ 2>/dev/null || true

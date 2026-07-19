@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68", "wheel", "cffi>=1.15"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "helix-llm"
+version = "1.0.0"
+description = "Python wrapper for libhelix — local LLM inference via the Helix C ABI"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Helix Authors"}]
+keywords = ["llm", "inference", "ai", "local"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "cffi>=1.15",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "mypy>=1.9",
+    "ruff>=0.4",
+]
+
+[project.urls]
+Homepage = "https://github.com/anemoi-ai/helix"
+Repository = "https://github.com/anemoi-ai/python"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.mypy]
+strict = true
+python_version = "3.10"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "ANN"]
+ignore = ["ANN101", "ANN102"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

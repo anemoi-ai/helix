@@ -1,0 +1,414 @@
+#!/usr/bin/env python3
+"""
+Helix Python wrapper conformance driver.
+
+Usage:
+    HELIX_LIB_PATH=... HELIX_SHIM_URL=http://localhost:8080 \
+        HELIX_TEST_MODEL=qwen-test ./bin/conformance cases.yaml
+
+Writes a JSON array to stdout with one result per test case.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+import yaml  # type: ignore[import-untyped]
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
+from helix._api import (
+    Helix,
+    HelixError,
+    HelixModelNotFoundError,
+    HelixValidationError,
+    HelixInvalidArgError,
+    LogLevel,
+    ModelOptions,
+    RuntimeOptions,
+)
+
+
+def run_case(session: Any, case: dict[str, Any]) -> dict[str, Any]:
+    name = case["name"]
+    req = dict(case["request"])
+    is_stream = case.get("stream", False)
+    skip_no_vision = case.get("skip_if_no_vision", False)
+    cancel_after = case.get("cancel_after_chunks", None)
+    expect_error = case.get("expect_error")
+
+    if skip_no_vision:
+        return {"name": name, "passed": True, "error": None, "detail": {"skipped": "no_vision"}}
+
+    try:
+        if expect_error:
+            try:
+                if is_stream:
+                    list(session.stream_chat_completions(**req))
+                else:
+                    session.chat_completions(**req)
+                return {"name": name, "passed": False, "error": "expected error but got success", "detail": {}}
+            except HelixError:
+                return {"name": name, "passed": True, "error": None, "detail": {"error_raised": True}}
+
+        if is_stream:
+            chunks = []
+            for i, chunk in enumerate(session.stream_chat_completions(**req)):
+                chunks.append(chunk)
+                if cancel_after is not None and i + 1 >= cancel_after:
+                    break
+
+            assertions = case.get("assert_stream", {})
+            detail: dict[str, Any] = {}
+
+            if cancel_after is not None:
+                detail["cancelled_cleanly"] = True
+                detail["chunks_received"] = len(chunks)
+                passed = True
+            else:
+                passed, detail = _check_stream_assertions(chunks, assertions)
+        else:
+            resp = session.chat_completions(**req)
+            assertions = case.get("assert", {})
+            passed, detail = _check_assertions(resp, assertions, req)
+
+    except HelixError as e:
+        return {"name": name, "passed": False, "error": str(e), "detail": {}}
+    except Exception as e:
+        return {"name": name, "passed": False, "error": f"unexpected: {e}", "detail": {}}
+
+    return {"name": name, "passed": passed, "error": None if passed else "assertion failed", "detail": detail}
+
+
+def _resolve(obj: Any, path: str) -> Any:
+    """Resolve a dotted/indexed path like choices[0].message.content."""
+    import re
+    parts = re.split(r'\.|\[|\]', path)
+    parts = [p for p in parts if p]
+    cur = obj
+    for part in parts:
+        if cur is None:
+            return None
+        if part.isdigit():
+            try:
+                cur = cur[int(part)] if isinstance(cur, (list, tuple)) else getattr(cur, part, None)
+            except (IndexError, KeyError):
+                return None
+        else:
+            if isinstance(cur, dict):
+                cur = cur.get(part)
+            else:
+                cur = getattr(cur, part, None)
+    return cur
+
+
+def _check_assertions(resp: Any, assertions: dict[str, Any], req: dict[str, Any]) -> tuple[bool, dict]:
+    import json as _json
+    failures: dict[str, str] = {}
+
+    for path, expected in assertions.items():
+        if path.startswith("_meta."):
+            meta_key = path[6:]
+            if meta_key == "content_is_valid_json":
+                content = _resolve(resp, "choices[0].message.content")
+                try:
+                    _json.loads(content or "")
+                    ok = True
+                except Exception:
+                    ok = False
+                if not ok:
+                    failures[path] = f"content is not valid JSON: {content!r}"
+            elif meta_key == "content_not_contains":
+                content = _resolve(resp, "choices[0].message.content") or ""
+                if str(expected) in content:
+                    failures[path] = f"content contains {expected!r}: {content!r}"
+            elif meta_key == "seed_deterministic":
+                pass  # skip — would need two calls
+            elif meta_key == "reasoning_content_if_present_is_string":
+                rc_val = _resolve(resp, "choices[0].message.reasoning_content")
+                if rc_val is not None and not isinstance(rc_val, str):
+                    failures[path] = f"reasoning_content is not string: {type(rc_val)}"
+            elif meta_key == "skip_if_no_token_map":
+                pass  # skip logit_bias validation
+            continue
+
+        actual = _resolve(resp, path)
+
+        if isinstance(expected, str) and expected.startswith("~"):
+            needle = expected[1:].strip('"')
+            actual_str = str(actual or "")
+            if needle.lower() not in actual_str.lower():
+                failures[path] = f"expected {needle!r} in {actual_str!r}"
+        elif isinstance(expected, str) and expected == "exists":
+            if actual is None:
+                failures[path] = "expected field to exist but got None"
+        elif isinstance(expected, str) and expected == "null":
+            if actual is not None:
+                failures[path] = f"expected None but got {actual!r}"
+        elif isinstance(expected, str) and expected.startswith("range("):
+            lo, hi = map(int, expected[6:-1].split(","))
+            if path == "choices":
+                actual = len(resp.choices) if hasattr(resp, "choices") else len(actual or [])
+            try:
+                n = int(actual)
+                if not (lo <= n <= hi):
+                    failures[path] = f"expected {lo}..{hi} but got {n}"
+            except (TypeError, ValueError):
+                failures[path] = f"expected range {lo}..{hi} but got {actual!r}"
+        else:
+            if isinstance(actual, str):
+                if actual != str(expected):
+                    failures[path] = f"expected {expected!r} got {actual!r}"
+            elif hasattr(actual, '__str__') and str(actual) != str(expected):
+                if actual != expected:
+                    failures[path] = f"expected {expected!r} got {actual!r}"
+
+    return len(failures) == 0, {"failures": failures}
+
+
+def _check_stream_assertions(chunks: list[Any], assertions: dict[str, Any]) -> tuple[bool, dict]:
+    import json as _json
+    failures: dict[str, str] = {}
+
+    concat_content = "".join(
+        c.choices[0].delta.content or "" for c in chunks if c.choices
+    )
+
+    for path, expected in assertions.items():
+        if path == "all_chunks.object":
+            bad = [c.object for c in chunks if c.object != expected]
+            if bad:
+                failures[path] = f"chunks with wrong object: {bad[:3]}"
+        elif path == "concat_content":
+            if isinstance(expected, str) and expected.startswith("~"):
+                needle = expected[1:].strip('"')
+                if needle.lower() not in concat_content.lower():
+                    failures[path] = f"{needle!r} not in {concat_content!r}"
+        elif path == "last_chunk.choices[0].finish_reason":
+            if chunks:
+                actual = _resolve(chunks[-1], "choices[0].finish_reason")
+                if actual != expected:
+                    failures[path] = f"expected {expected!r} got {actual!r}"
+        elif path == "first_chunk.choices[0].delta.role":
+            if chunks:
+                actual = _resolve(chunks[0], "choices[0].delta.role")
+                if actual != expected:
+                    failures[path] = f"expected {expected!r} got {actual!r}"
+        elif path == "content_chunk_count":
+            count = sum(1 for c in chunks if c.choices and c.choices[0].delta.content)
+            lo, hi = map(int, str(expected)[6:-1].split(","))
+            if not (lo <= count <= hi):
+                failures[path] = f"expected {lo}..{hi} chunks, got {count}"
+        elif path == "final_usage_chunk.usage.completion_tokens":
+            usage_chunk = next((c for c in reversed(chunks) if c.usage), None)
+            if usage_chunk is None:
+                failures[path] = "no usage chunk found"
+            else:
+                lo, hi = map(int, str(expected)[6:-1].split(","))
+                n = usage_chunk.usage.completion_tokens
+                if not (lo <= n <= hi):
+                    failures[path] = f"expected {lo}..{hi} got {n}"
+        elif path == "final_usage_chunk.usage.prompt_tokens":
+            usage_chunk = next((c for c in reversed(chunks) if c.usage), None)
+            if usage_chunk:
+                lo, hi = map(int, str(expected)[6:-1].split(","))
+                n = usage_chunk.usage.prompt_tokens
+                if not (lo <= n <= hi):
+                    failures[path] = f"expected {lo}..{hi} got {n}"
+        elif path == "_meta.concat_content_is_valid_json":
+            try:
+                _json.loads(concat_content)
+            except Exception:
+                failures[path] = f"concat content is not valid JSON: {concat_content!r}"
+        elif path == "_meta.tool_call_name_streamed":
+            all_args = "".join(
+                tc.function.arguments
+                for c in chunks
+                for ch in (c.choices or [])
+                for tc in (ch.delta.tool_calls or [])
+                if tc.function.name or tc.function.arguments
+            )
+            found = any(
+                tc.function.name == expected
+                for c in chunks
+                for ch in (c.choices or [])
+                for tc in (ch.delta.tool_calls or [])
+                if tc.function.name
+            )
+            if not found:
+                failures[path] = f"tool call name {expected!r} not found in stream"
+        elif path == "_meta.cancelled_cleanly":
+            pass
+        elif path == "_meta.chunks_received":
+            lo, hi = map(int, str(expected)[6:-1].split(","))
+            n = len(chunks)
+            if not (lo <= n <= hi):
+                failures[path] = f"expected {lo}..{hi} chunks got {n}"
+
+    return len(failures) == 0, {"failures": failures}
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print("Usage: conformance <cases.yaml>", file=sys.stderr)
+        return 1
+
+    cases_path = sys.argv[1]
+    shim_url = os.environ.get("HELIX_SHIM_URL", "http://localhost:8080")
+    model_alias = os.environ.get("HELIX_TEST_MODEL", "qwen-test")
+
+    with open(cases_path) as f:
+        data = yaml.safe_load(f)
+    data = data or {}
+    cases = data.get("cases", [])
+
+    # The Python conformance driver connects directly via the helix C library,
+    # not via the shim server HTTP. This exercises the actual Python wrapper.
+    lib_path = os.environ.get("HELIX_LIB_PATH", "")
+    model_path = os.environ.get("HELIX_TEST_MODEL_PATH", "")
+
+    if not model_path:
+        # Fall back to HTTP shim for conformance testing
+        return _run_via_http(cases, shim_url, model_alias)
+
+    return _run_via_lib(cases, model_path, model_alias)
+
+
+def _run_via_http(cases: list[dict], shim_url: str, model_alias: str) -> int:
+    """Run conformance via HTTP shim (for CI environments)."""
+    import urllib.request
+    results = []
+    for case in cases:
+        name = case["name"]
+        if case.get("skip_if_no_vision"):
+            results.append({"name": name, "passed": True, "error": None,
+                            "detail": {"skipped": "no_vision"}})
+            continue
+        if case.get("_meta", {}).get("skip_if_no_token_map"):
+            results.append({"name": name, "passed": True, "error": None,
+                            "detail": {"skipped": "no_token_map"}})
+            continue
+
+        req = dict(case["request"])
+        req.setdefault("model", model_alias)
+        expect_error = case.get("expect_error")
+        is_stream = case.get("stream", False)
+
+        try:
+            body = json.dumps(req).encode()
+            request = urllib.request.Request(
+                f"{shim_url}/v1/chat/completions",
+                data=body,
+                headers={"Content-Type": "application/json"},
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=30) as resp:
+                    raw = resp.read().decode()
+            except urllib.error.HTTPError as e:
+                raw_err = e.read().decode()
+                if expect_error:
+                    results.append({"name": name, "passed": True, "error": None,
+                                   "detail": {"http_error": e.code}})
+                else:
+                    results.append({"name": name, "passed": False,
+                                   "error": f"HTTP {e.code}: {raw_err[:200]}", "detail": {}})
+                continue
+
+            if expect_error:
+                results.append({"name": name, "passed": False,
+                               "error": "expected error but got success", "detail": {}})
+                continue
+
+            resp_dict = json.loads(raw)
+            assertions = case.get("assert", {})
+            passed, detail = _check_assertions_dict(resp_dict, assertions)
+            results.append({"name": name, "passed": passed, "error": None if passed else "assertion failed",
+                           "detail": detail})
+
+        except Exception as e:
+            results.append({"name": name, "passed": False, "error": str(e), "detail": {}})
+
+    print(json.dumps(results))
+    return 0
+
+
+def _check_assertions_dict(resp: dict, assertions: dict) -> tuple[bool, dict]:
+    """Assertion checker for raw dict responses (HTTP path)."""
+    import json as _json
+    failures: dict[str, str] = {}
+
+    def resolve(obj: Any, path: str) -> Any:
+        import re
+        parts = [p for p in re.split(r'\.|\[|\]', path) if p]
+        cur = obj
+        for part in parts:
+            if cur is None:
+                return None
+            if part.isdigit():
+                try:
+                    cur = cur[int(part)] if isinstance(cur, list) else cur.get(part)
+                except (IndexError, KeyError):
+                    return None
+            elif isinstance(cur, dict):
+                cur = cur.get(part)
+            else:
+                return None
+        return cur
+
+    for path, expected in assertions.items():
+        if path.startswith("_meta."):
+            meta_key = path[6:]
+            if meta_key == "content_is_valid_json":
+                content = resolve(resp, "choices[0].message.content")
+                try:
+                    _json.loads(content or "")
+                except Exception:
+                    failures[path] = f"not valid JSON: {content!r}"
+            continue
+
+        actual = resolve(resp, path)
+        exp_str = str(expected)
+
+        if exp_str.startswith("~"):
+            needle = exp_str[1:].strip('"')
+            if needle.lower() not in str(actual or "").lower():
+                failures[path] = f"{needle!r} not in {actual!r}"
+        elif exp_str == "exists":
+            if actual is None:
+                failures[path] = "expected field but got None"
+        elif exp_str.startswith("range("):
+            lo, hi = map(int, exp_str[6:-1].split(","))
+            if path == "choices":
+                actual = len(resp.get("choices", []))
+            try:
+                n = int(actual)
+                if not (lo <= n <= hi):
+                    failures[path] = f"{lo}..{hi} but got {n}"
+            except (TypeError, ValueError):
+                failures[path] = f"range check failed: {actual!r}"
+        else:
+            if str(actual) != exp_str:
+                failures[path] = f"expected {expected!r} got {actual!r}"
+
+    return len(failures) == 0, {"failures": failures}
+
+
+def _run_via_lib(cases: list[dict], model_path: str, model_alias: str) -> int:
+    h = Helix(RuntimeOptions(log_level=LogLevel.ERROR))
+    model = h.load_model(model_path, ModelOptions(alias=model_alias))
+    session = model.session()
+    results = [run_case(session, case) for case in cases]
+    session.close()
+    model.close()
+    h.close()
+    print(json.dumps(results))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

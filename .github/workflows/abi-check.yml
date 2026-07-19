@@ -1,0 +1,172 @@
+name: ABI compatibility
+
+on:
+  pull_request:
+    paths:
+      - 'helix.h'
+      - 'helix.ld'
+      - 'helix.exp'
+      - 'helix.def'
+      - 'src/**'
+      - 'CMakeLists.txt'
+
+jobs:
+  abi-check:
+    name: ABI (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux
+            runner: ubuntu-latest
+          - label: windows
+            runner: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # ============================================================ #
+      #  Linux: deep ABI compliance + symbol/node verification       #
+      # ============================================================ #
+      # The abi-compliance-checker comparison needs a published v1.0.0
+      # baseline artefact on GitHub Releases. Disabled (if: false) until one
+      # is uploaded; the symbol-set and version-node checks below still run.
+      - name: Install tools
+        if: false
+        run: sudo apt-get install -y abi-compliance-checker abi-dumper
+
+      - name: Download v1.0.0 baseline artefact
+        if: false
+        run: |
+          curl -fsSL -o baseline.tar.xz \
+            https://github.com/anemoi-ai/helix/releases/download/v1.0.0/libhelix-1.0.0-linux-x86_64-cpu.tar.xz
+          tar xJf baseline.tar.xz
+
+      - name: Dump baseline ABI
+        if: false
+        run: |
+          abi-dumper libhelix-1.0.0/lib/libhelix.so.1 \
+            -o baseline.dump \
+            -lver 1.0.0 \
+            -public-headers libhelix-1.0.0/include
+
+      - name: Build current (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cmake -B build \
+            -DHELIX_BACKEND=cpu \
+            -DHELIX_BUILD_TESTS=OFF \
+            -DHELIX_BUILD_TOOLS=OFF \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build build --parallel $(nproc)
+
+      - name: Dump current ABI
+        if: false
+        run: |
+          abi-dumper build/libhelix.so.1.*.* \
+            -o current.dump \
+            -lver "$(git describe --tags --always)" \
+            -public-headers helix.h
+
+      - name: Compare ABI
+        if: false
+        run: |
+          abi-compliance-checker \
+            -l helix \
+            -old baseline.dump \
+            -new current.dump \
+            -strict
+
+      - name: Verify symbol set (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          EXPECTED="helix_abi_version helix_chat_completions helix_chat_completions_stream \
+            helix_count_tokens helix_embeddings helix_free helix_last_error_json \
+            helix_model_describe helix_model_describe_copy helix_model_embedding_dim \
+            helix_model_hidden_dim helix_model_load helix_model_load_ex helix_model_release \
+            helix_rerank helix_runtime_create helix_runtime_describe \
+            helix_runtime_describe_copy helix_runtime_destroy helix_session_cancel \
+            helix_session_create helix_session_describe helix_session_destroy \
+            helix_session_encode helix_session_restore helix_session_save \
+            helix_set_log_callback helix_tokenize helix_version_string"
+          ACTUAL=$(nm -D --defined-only build/libhelix.so.1.*.* | awk '{print $3}' | grep '^helix_' | sort)
+          EXPECTED_SORTED=$(echo "$EXPECTED" | tr ' ' '\n' | sort)
+          if [ "$ACTUAL" != "$EXPECTED_SORTED" ]; then
+            echo "FAIL: exported symbol set differs from the 29-symbol 1.5 surface"
+            echo "--- expected ---"
+            echo "$EXPECTED_SORTED"
+            echo "--- actual ---"
+            echo "$ACTUAL"
+            exit 1
+          fi
+          echo "OK: 29 symbols exactly"
+
+      - name: Verify version nodes (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # The frozen HELIX_1.0 node must still carry exactly the original
+          # 16 symbols; each later node adds only its own symbols.
+          V10="helix_abi_version helix_chat_completions helix_chat_completions_stream \
+            helix_free helix_last_error_json helix_model_describe helix_model_load \
+            helix_model_release helix_runtime_create helix_runtime_describe \
+            helix_runtime_destroy helix_session_cancel helix_session_create \
+            helix_session_destroy helix_set_log_callback helix_version_string"
+          V11="helix_embeddings helix_model_embedding_dim"
+          V12="helix_session_describe"
+          V13="helix_runtime_describe_copy helix_model_describe_copy \
+            helix_session_encode helix_model_hidden_dim"
+          V14="helix_count_tokens helix_tokenize helix_model_load_ex"
+          V15="helix_session_save helix_session_restore helix_rerank"
+          DYNSYMS=$(objdump -T build/libhelix.so.1.*.* | grep ' helix_')
+          for node in V10 V11 V12 V13 V14 V15; do
+            eval "syms=\${$node}"
+            ver="${node#V}"
+            ver="HELIX_${ver#0}"
+            for sym in $syms; do
+              echo "$DYNSYMS" | grep -Eq "${ver}  +${sym}\$" || {
+                echo "FAIL: $sym is not bound to ${ver}"; exit 1; }
+            done
+          done
+          echo "OK: HELIX_1.0 (16), 1.1 (2), 1.2 (1), 1.3 (4), 1.4 (3), 1.5 (3) nodes correct"
+
+      # ============================================================ #
+      #  Windows: build helix.dll + 29-symbol export verification    #
+      # ============================================================ #
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cmake -B build -G "Visual Studio 17 2022" -A x64 ^
+            -DHELIX_BACKEND=cpu -DHELIX_BUILD_TESTS=OFF ^
+            -DHELIX_BUILD_TOOLS=OFF -DCMAKE_BUILD_TYPE=Release
+        shell: cmd
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: cmake --build build --config Release --parallel
+        shell: cmd
+
+      - name: Verify 29-symbol export surface (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Find helix.dll (output dir varies by generator/config)
+          $dll = Get-ChildItem -Path build -Recurse -Filter "helix.dll" |
+                 Select-Object -First 1
+          if (-not $dll) { Write-Error "helix.dll not found"; exit 1 }
+
+          # Use dumpbin to list exports, count the helix_ entries
+          $exports = & dumpbin /exports $dll.FullName |
+                     Select-String -Pattern '^\s+\d+\s+[0-9A-F]+\s+helix_' |
+                     ForEach-Object { ($_.Line -split '\s+')[-1].Trim() }
+          $count = $exports.Count
+
+          Write-Output "Found $count exported helix_ symbols:"
+          $exports | Sort-Object | ForEach-Object { Write-Output "  $_" }
+
+          if ($count -ne 29) {
+            Write-Error "Expected 29 helix_ symbols, got $count"
+            exit 1
+          }
+          Write-Output "OK: 29 symbols exactly"

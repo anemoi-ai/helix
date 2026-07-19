@@ -1,0 +1,152 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # --------------------------------------------------------------- #
+  #  Build + unit tests + integration tests (fast, most coverage)   #
+  # --------------------------------------------------------------- #
+  test:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64
+          - label: linux-x64-cpu
+            runner: ubuntu-latest
+            backend: cpu
+            run_integration: true
+          - label: linux-x64-cuda
+            runner: ubuntu-latest
+            backend: cuda
+            run_integration: true
+          # Windows x86_64
+          - label: windows-x64-cpu
+            runner: windows-2022
+            backend: cpu
+            run_integration: true
+          - label: windows-x64-cuda
+            runner: windows-2022
+            backend: cuda
+            run_integration: false       # hosted Windows = no NVIDIA GPU
+          - label: windows-x64-vulkan
+            runner: windows-2022
+            backend: vulkan
+            run_integration: false       # hosted Windows = no Vulkan GPU
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # ---- Model cache (shared across platforms) ----
+      - name: Cache test model
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: Qwen3.5-0.8B-Q4_K_M.gguf
+          key: qwen3.5-0.8b-q4_k_m-gguf
+
+      - name: Download test model
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL \
+            -o Qwen3.5-0.8B-Q4_K_M.gguf \
+            "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf?download=true"
+
+      - name: Cache embedding model download
+        id: embed-model-cache
+        uses: actions/cache@v4
+        with:
+          path: nomic-embed-text-v1.5.Q8_0.gguf
+          key: nomic-embed-text-v1.5-q8_0-gguf
+
+      - name: Download embedding test model
+        if: steps.embed-model-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL \
+            -o nomic-embed-text-v1.5.Q8_0.gguf \
+            "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q8_0.gguf?download=true"
+
+      # ---- Backend-specific prerequisites ----
+      - name: Install CUDA Toolkit (Windows, CUDA backend)
+        if: matrix.backend == 'cuda' && runner.os == 'Windows'
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: '12.6.2'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart", "cudart_dev"]'
+      - name: Install Vulkan SDK (Windows, Vulkan backend)
+        if: matrix.backend == 'vulkan' && runner.os == 'Windows'
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: '1.3.296.0'
+
+      # ---- Configure ----
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cmake -B build \
+            -DHELIX_BACKEND=${{ matrix.backend }} \
+            -DHELIX_BUILD_TESTS=ON \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cmake -B build -G "Visual Studio 17 2022" -A x64 ^
+            -DHELIX_BACKEND=${{ matrix.backend }} -DHELIX_BUILD_TESTS=ON ^
+            -DCMAKE_BUILD_TYPE=Release
+        shell: cmd
+
+      # ---- Build ----
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: cmake --build build --parallel $(nproc)
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: cmake --build build --config Release --parallel
+        shell: cmd
+
+      # ---- Unit tests ----
+      - name: Unit tests (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          ctest --test-dir build \
+            --output-on-failure \
+            --output-junit build/test-results.xml
+        env:
+          HELIX_BACKEND_CPU: "1"
+      - name: Unit tests (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          ctest --test-dir build -C Release --output-on-failure
+        shell: cmd
+
+      # ---- Integration tests ----
+      - name: Integration tests (Linux)
+        if: matrix.run_integration && runner.os == 'Linux'
+        run: |
+          ./build/tests/helix_integration_tests
+        env:
+          HELIX_TEST_MODEL: "${{ github.workspace }}/Qwen3.5-0.8B-Q4_K_M.gguf"
+          HELIX_TEST_EMBED_MODEL: "${{ github.workspace }}/nomic-embed-text-v1.5.Q8_0.gguf"
+      - name: Integration tests (Windows)
+        if: matrix.run_integration && runner.os == 'Windows'
+        run: |
+          .\build\bin\Release\helix_integration_tests.exe
+        shell: cmd
+        env:
+          HELIX_TEST_MODEL: '${{ github.workspace }}\Qwen3.5-0.8B-Q4_K_M.gguf'
+          HELIX_TEST_EMBED_MODEL: '${{ github.workspace }}\nomic-embed-text-v1.5.Q8_0.gguf'
+
+      - name: Upload test results
+        if: always() && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.label }}
+          path: build/test-results.xml
+          retention-days: 30

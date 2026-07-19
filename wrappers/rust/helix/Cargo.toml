@@ -1,0 +1,31 @@
+[package]
+name = "helix"
+version = "1.0.0"
+edition = "2021"
+description = "Idiomatic Rust wrapper for libhelix — local LLM inference"
+license = "MIT"
+repository = "https://github.com/anemoi-ai/rust"
+
+[[bin]]
+name = "conformance"
+path = "src/bin/conformance.rs"
+required-features = ["conformance"]
+
+[features]
+default = ["tokio"]
+tokio = ["dep:tokio", "dep:futures"]
+conformance = ["tokio", "dep:reqwest", "dep:serde_yaml", "dep:anyhow"]
+
+[dependencies]
+helix-sys = { path = "../helix-sys" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"], optional = true }
+futures = { version = "0.3", optional = true }
+reqwest = { version = "0.12", features = ["json"], optional = true }
+serde_yaml = { version = "0.9", optional = true }
+anyhow = { version = "1", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

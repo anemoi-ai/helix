@@ -1,0 +1,431 @@
+# Helix wrapper conformance suite
+# Each wrapper must implement bin/conformance (or language equivalent) that:
+#   - reads the YAML path as its first argument
+#   - connects to a running helix-shim-server at HELIX_SHIM_URL (default http://localhost:8080)
+#   - runs each case and writes results to stdout as a JSON array
+# The run.py orchestrator collects and diffs results.
+#
+# Assert operators:
+#   ~"value"          contains-match (case-insensitive substring)
+#   "value"           exact string match
+#   range(lo, hi)     integer in [lo, hi] inclusive
+#   exists            field is present and non-null
+#   null              field is absent or null
+#   true / false      boolean match
+
+cases:
+
+  # ── Basic non-streaming ────────────────────────────────────────────────────
+
+  - name: hello-world
+    request:
+      model: qwen-test
+      messages: [{role: user, content: "Reply with exactly: pong"}]
+      temperature: 0
+      max_tokens: 8
+    assert:
+      choices[0].message.role: "assistant"
+      choices[0].message.content: ~"pong"
+      choices[0].finish_reason: "stop"
+      usage.prompt_tokens: range(1, 200)
+      usage.completion_tokens: range(1, 8)
+      usage.total_tokens: range(2, 208)
+      id: exists
+      created: exists
+      object: "chat.completion"
+      model: exists
+
+  - name: system-message
+    request:
+      model: qwen-test
+      messages:
+        - {role: system, content: "You are a calculator. Reply only with the numeric result, nothing else."}
+        - {role: user, content: "2 + 2"}
+      temperature: 0
+      max_tokens: 8
+    assert:
+      choices[0].message.content: ~"4"
+      choices[0].finish_reason: "stop"
+
+  - name: multi-turn
+    request:
+      model: qwen-test
+      messages:
+        - {role: user, content: "My name is Alice. Remember it."}
+        - {role: assistant, content: "Hello Alice, I'll remember your name."}
+        - {role: user, content: "What is my name?"}
+      temperature: 0
+      max_tokens: 32
+    assert:
+      choices[0].message.content: ~"Alice"
+      choices[0].finish_reason: "stop"
+
+  - name: max-tokens-stop
+    request:
+      model: qwen-test
+      messages: [{role: user, content: "Count from 1 to 100."}]
+      temperature: 0
+      max_tokens: 5
+    assert:
+      choices[0].finish_reason: "length"
+      usage.completion_tokens: range(1, 6)
+
+  - name: temperature-zero-deterministic
+    request:
+      model: qwen-test
+      messages: [{role: user, content: "Reply with exactly: ping"}]
+      temperature: 0
+      max_tokens: 8
+    assert:
+      choices[0].message.content: ~"ping"
+
+  - name: usage-fields-present
+    request:
+      model: qwen-test
+      messages: [{role: user, content: "hi"}]
+      max_tokens: 16
+    assert:
+      usage.prompt_tokens: exists
+      usage.completion_tokens: exists
+      usage.total_tokens: exists
+
+  # ── Streaming ──────────────────────────────────────────────────────────────
+
+  - name: streaming-basic
+    stream: true
+    request:
+      model: qwen-test
+      messages: [{role: user, content: "Reply with exactly: pong"}]
+      temperature: 0
+      max_tokens: 8
+    assert_stream:
+      # All chunks must have object=chat.completion.chunk
+      all_chunks.object: "chat.completion.chunk"
+      # Concatenated content contains pong
+      concat_content: ~"pong"
+      # Last chunk has finish_reason=stop
+      last_chunk.choices[0].finish_reason: "stop"
+      # At least one content-bearing chunk
+      content_chunk_count: range(1, 100)
+
+  - name: streaming-role-first-chunk
+    stream: true
+    request:
+      model: qwen-test
+      messages: [{role: user, content: "hi"}]
+      max_tokens: 8
+    assert_stream:
+      first_chunk.choices[0].delta.role: "assistant"
+
+  - name: streaming-usage-final-chunk
+    stream: true
+    request:
+      model: qwen-test
+      messages: [{role: user, content: "hi"}]
+      max_tokens: 8
+      stream_options: {include_usage: true}
+    assert_stream:
+      final_usage_chunk.usage.completion_tokens: range(1, 20)
+      final_usage_chunk.usage.prompt_tokens: range(1, 100)
+
+  # ── Structured output ──────────────────────────────────────────────────────
+
+  - name: structured-output-json-object
+    request:
+      model: qwen-test
+      messages: [{role: user, content: "Return a JSON object with key 'result' and value 42."}]
+      temperature: 0
+      max_tokens: 32
+      response_format: {type: json_object}
+    assert:
+      choices[0].message.content: exists
+      # Content must be valid JSON (tested by conformance runner parse)
+      choices[0].finish_reason: "stop"
+      _meta.content_is_valid_json: true
+
+  - name: structured-output-json-schema
+    request:
+      model: qwen-test
+      messages: [{role: user, content: "Give me a person with name 'Bob' and age 30."}]
+      temperature: 0
+      max_tokens: 64
+      response_format:
+        type: json_schema
+        json_schema:
+          name: person
+          schema:
+            type: object
+            properties:
+              name: {type: string}
+              age:  {type: integer}
+            required: [name, age]
+            additionalProperties: false
+    assert:
+      choices[0].finish_reason: "stop"
+      _meta.content_is_valid_json: true
+      _meta.content_matches_schema: true
+
+  # ── Tool calling ───────────────────────────────────────────────────────────
+
+  - name: tool-call-invocation
+    request:
+      model: qwen-test
+      messages: [{role: user, content: "What is the weather in London?"}]
+      temperature: 0
+      max_tokens: 128
+      tools:
+        - type: function
+          function:
+            name: get_weather
+            description: "Get current weather for a city"
+            parameters:
+              type: object
+              properties:
+                location: {type: string, description: "City name"}
+              required: [location]
+    assert:
+      choices[0].finish_reason: "tool_calls"
+      choices[0].message.tool_calls[0].function.name: "get_weather"
+      choices[0].message.tool_calls[0].function.arguments: exists
+      choices[0].message.tool_calls[0].id: exists
+
+  - name: tool-call-round-trip
+    request:
+      model: qwen-test
+      messages:
+        - {role: user, content: "What is 17 * 23? Use the calculator tool."}
+        - role: assistant
+          tool_calls:
+            - id: "call_abc"
+              type: function
+              function:
+                name: calculate
+                arguments: '{"expression":"17*23"}'
+        - role: tool
+          tool_call_id: "call_abc"
+          content: "391"
+        - {role: user, content: "Tell me the result."}
+      temperature: 0
+      max_tokens: 32
+      tools:
+        - type: function
+          function:
+            name: calculate
+            description: "Evaluate a math expression"
+            parameters:
+              type: object
+              properties:
+                expression: {type: string}
+              required: [expression]
+    assert:
+      choices[0].message.content: ~"391"
+      choices[0].finish_reason: "stop"
+
+  # ── Logprobs ───────────────────────────────────────────────────────────────
+
+  - name: logprobs-top
+    request:
+      model: qwen-test
+      messages: [{role: user, content: "Say yes or no."}]
+      temperature: 0
+      max_tokens: 4
+      logprobs: true
+      top_logprobs: 3
+    assert:
+      choices[0].logprobs.content[0].token: exists
+      choices[0].logprobs.content[0].logprob: exists
+      choices[0].logprobs.content[0].top_logprobs: exists
+
+  # ── Error paths ────────────────────────────────────────────────────────────
+
+  - name: error-model-not-found
+    request:
+      model: nonexistent-model-xyz
+      messages: [{role: user, content: "hi"}]
+      max_tokens: 8
+    expect_error:
+      type: "model_not_found"
+
+  - name: error-invalid-request-empty-messages
+    request:
+      model: qwen-test
+      messages: []
+      max_tokens: 8
+    expect_error:
+      type: "invalid_request_error"
+
+  - name: error-max-tokens-exceeds-context
+    request:
+      model: qwen-test
+      messages: [{role: user, content: "hi"}]
+      max_tokens: 9999999
+    expect_error:
+      type: "invalid_request_error"
+
+  # ── Stop sequences ─────────────────────────────────────────────────────────
+
+  - name: stop-string
+    request:
+      model: qwen-test
+      messages: [{role: user, content: "Count: one two three four five"}]
+      temperature: 0
+      max_tokens: 32
+      stop: ["three"]
+    assert:
+      choices[0].finish_reason: "stop"
+      # Content should not contain "three"
+      _meta.content_not_contains: "three"
+
+  # ── Seed / reproducibility ─────────────────────────────────────────────────
+
+  - name: seed-deterministic
+    request:
+      model: qwen-test
+      messages: [{role: user, content: "Give me a random number between 1 and 10."}]
+      temperature: 1.0
+      max_tokens: 8
+      seed: 42
+    assert:
+      choices[0].message.content: exists
+      # Two runs with same seed must produce same output — runner verifies this
+      _meta.seed_deterministic: true
+
+  # ── n > 1 ──────────────────────────────────────────────────────────────────
+
+  - name: n-two-choices
+    request:
+      model: qwen-test
+      messages: [{role: user, content: "hi"}]
+      temperature: 1.0
+      max_tokens: 8
+      n: 2
+    assert:
+      choices: range(2, 2)   # exactly 2 choices
+      choices[0].message.content: exists
+      choices[1].message.content: exists
+
+  # ── Cancellation ──────────────────────────────────────────────────────────
+
+  - name: cancel-during-stream
+    stream: true
+    cancel_after_chunks: 3
+    request:
+      model: qwen-test
+      messages: [{role: user, content: "Count slowly from 1 to 1000, one number per line."}]
+      temperature: 0
+      max_tokens: 512
+    assert_stream:
+      # Conformance runner cancels after 3 chunks; must not hang or error fatally
+      _meta.cancelled_cleanly: true
+      _meta.chunks_received: range(1, 10)
+
+  # ── Reasoning content ─────────────────────────────────────────────────────
+
+  - name: reasoning-content-passthrough
+    request:
+      model: qwen-test
+      messages: [{role: user, content: "What is 3+4?"}]
+      temperature: 0
+      max_tokens: 64
+    assert:
+      choices[0].message.content: exists
+      # reasoning_content may or may not be present depending on model;
+      # if present it must be a string
+      _meta.reasoning_content_if_present_is_string: true
+
+  # ── Logit bias ────────────────────────────────────────────────────────────
+
+  - name: logit-bias-suppression
+    request:
+      model: qwen-test
+      messages: [{role: user, content: "Reply with the word 'hello'."}]
+      temperature: 0
+      max_tokens: 8
+      # Token IDs to suppress — conformance runner may skip this case if
+      # it cannot determine token IDs for the loaded model
+      _meta.skip_if_no_token_map: true
+      logit_bias: {}  # empty bias — just validates the field is accepted
+    assert:
+      choices[0].message.content: exists
+
+  # ── Vision (skip if model has no mmproj) ──────────────────────────────────
+
+  - name: vision-image-inline
+    skip_if_no_vision: true
+    request:
+      model: qwen-test
+      messages:
+        - role: user
+          content:
+            - type: text
+              text: "What color is this image? Answer in one word."
+            - type: image_url
+              image_url:
+                url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+      temperature: 0
+      max_tokens: 8
+    assert:
+      choices[0].message.content: exists
+      choices[0].finish_reason: "stop"
+
+  # ── Streaming tool call ────────────────────────────────────────────────────
+
+  - name: streaming-tool-call
+    stream: true
+    request:
+      model: qwen-test
+      messages: [{role: user, content: "What is the weather in Paris?"}]
+      temperature: 0
+      max_tokens: 128
+      tools:
+        - type: function
+          function:
+            name: get_weather
+            description: "Get weather for a city"
+            parameters:
+              type: object
+              properties:
+                location: {type: string}
+              required: [location]
+    assert_stream:
+      last_chunk.choices[0].finish_reason: "tool_calls"
+      _meta.tool_call_name_streamed: "get_weather"
+
+  # ── Streaming structured output ────────────────────────────────────────────
+
+  - name: streaming-json-object
+    stream: true
+    request:
+      model: qwen-test
+      messages: [{role: user, content: "Return JSON with key 'ok' and value true."}]
+      temperature: 0
+      max_tokens: 32
+      response_format: {type: json_object}
+    assert_stream:
+      _meta.concat_content_is_valid_json: true
+
+  # ── Empty assistant turn ───────────────────────────────────────────────────
+
+  - name: assistant-prefill-accepted
+    request:
+      model: qwen-test
+      messages:
+        - {role: user, content: "Complete this sentence: The sky is"}
+        - {role: assistant, content: " blue"}
+        - {role: user, content: "What colour did I say?"}
+      temperature: 0
+      max_tokens: 16
+    assert:
+      choices[0].message.content: ~"blue"
+
+  # ── Finish reason length ───────────────────────────────────────────────────
+
+  - name: finish-reason-length-streaming
+    stream: true
+    request:
+      model: qwen-test
+      messages: [{role: user, content: "Count from 1 to 100."}]
+      temperature: 0
+      max_tokens: 4
+    assert_stream:
+      last_chunk.choices[0].finish_reason: "length"

@@ -1,0 +1,287 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  HELIX_VERSION: ${{ github.ref_name }}   # e.g. v1.0.0
+
+jobs:
+  # ------------------------------------------------------------------ #
+  #  Build matrix — one job per (platform, arch, backend)              #
+  # ------------------------------------------------------------------ #
+  build:
+    name: Build ${{ matrix.platform }}-${{ matrix.arch }}-${{ matrix.backend }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64
+          - { platform: linux,   arch: x86_64,  backend: cpu,    runner: ubuntu-22.04 }
+          - { platform: linux,   arch: x86_64,  backend: cuda,   runner: ubuntu-22.04 }
+          - { platform: linux,   arch: x86_64,  backend: vulkan, runner: ubuntu-22.04 }
+          - { platform: linux,   arch: x86_64,  backend: rocm,   runner: ubuntu-22.04 }
+          - { platform: linux,   arch: x86_64,  backend: omni,   runner: ubuntu-22.04 }
+          # Linux aarch64
+          - { platform: linux,   arch: aarch64, backend: cpu,    runner: ubuntu-22.04-arm }
+          - { platform: linux,   arch: aarch64, backend: vulkan, runner: ubuntu-22.04-arm }
+          # macOS arm64
+          - { platform: macos,   arch: arm64,   backend: metal,  runner: macos-14 }
+          # macOS x86_64
+          - { platform: macos,   arch: x86_64,  backend: cpu,    runner: macos-14-large }
+          - { platform: macos,   arch: x86_64,  backend: vulkan, runner: macos-14-large }
+          # Windows x86_64
+          - { platform: windows, arch: x86_64,  backend: cpu,    runner: windows-2022 }
+          - { platform: windows, arch: x86_64,  backend: cuda,   runner: windows-2022 }
+          - { platform: windows, arch: x86_64,  backend: vulkan, runner: windows-2022 }
+          - { platform: windows, arch: x86_64,  backend: omni,   runner: windows-2022 }
+          # Windows arm64
+          - { platform: windows, arch: arm64,   backend: cpu,    runner: windows-11-arm }
+          - { platform: windows, arch: arm64,   backend: vulkan, runner: windows-11-arm }
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DHELIX_BACKEND=${{ matrix.backend }} \
+            -DHELIX_BUILD_TESTS=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=dist
+        shell: bash
+
+      - name: Build
+        run: cmake --build build --parallel --config Release
+
+      - name: Install to staging
+        run: cmake --install build --config Release
+        shell: bash
+
+      - name: Sign (macOS)
+        if: matrix.platform == 'macos'
+        env:
+          APPLE_CERT_P12:     ${{ secrets.APPLE_DEVELOPER_ID_CERT_P12 }}
+          APPLE_CERT_PASS:    ${{ secrets.APPLE_DEVELOPER_ID_CERT_PASS }}
+          APPLE_TEAM_ID:      ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_NOTARY_USER:  ${{ secrets.APPLE_NOTARY_USER }}
+          APPLE_NOTARY_PASS:  ${{ secrets.APPLE_NOTARY_PASS }}
+        run: |
+          echo "$APPLE_CERT_P12" | base64 --decode > cert.p12
+          security create-keychain -p "" build.keychain
+          security import cert.p12 -k build.keychain -P "$APPLE_CERT_PASS" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
+          security default-keychain -s build.keychain
+          find dist/lib dist/bin -type f \( -name "*.dylib" -o -perm +111 \) | while read f; do
+            codesign --timestamp --options runtime \
+              --sign "Developer ID Application: Anemoi AI ($APPLE_TEAM_ID)" "$f"
+          done
+          # Create a zip for notarisation
+          zip -r dist.zip dist/
+          xcrun notarytool submit dist.zip \
+            --apple-id "$APPLE_NOTARY_USER" \
+            --password "$APPLE_NOTARY_PASS" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+
+      - name: Sign (Windows)
+        if: matrix.platform == 'windows'
+        env:
+          AUTHENTICODE_CERT: ${{ secrets.AUTHENTICODE_CERT_PFX }}
+          AUTHENTICODE_PASS: ${{ secrets.AUTHENTICODE_CERT_PASS }}
+        run: |
+          echo "$env:AUTHENTICODE_CERT" | Out-File -Encoding ascii cert.pfx.b64
+          certutil -decode cert.pfx.b64 cert.pfx
+          Get-ChildItem dist -Recurse -Include *.dll,*.exe | ForEach-Object {
+            & 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\signtool.exe' sign `
+              /f cert.pfx /p "$env:AUTHENTICODE_PASS" `
+              /tr http://timestamp.digicert.com /td sha256 /fd sha256 `
+              $_.FullName
+          }
+        shell: pwsh
+
+      - name: Package artefact
+        run: |
+          SLUG="${{ matrix.platform }}-${{ matrix.arch }}-${{ matrix.backend }}"
+          NAME="libhelix-${HELIX_VERSION#v}-$SLUG"
+          if [ "${{ matrix.platform }}" = "windows" ]; then
+            7z a "${NAME}.zip" dist/
+            echo "ARTEFACT=${NAME}.zip" >> "$GITHUB_ENV"
+          else
+            tar cJf "${NAME}.tar.xz" dist/
+            echo "ARTEFACT=${NAME}.tar.xz" >> "$GITHUB_ENV"
+          fi
+        shell: bash
+
+      - name: Generate SBOM
+        run: |
+          pip install cyclonedx-bom 2>/dev/null || true
+          mkdir -p dist/share/helix
+          cat > dist/share/helix/sbom.cdx.json <<EOF
+          {"bomFormat":"CycloneDX","specVersion":"1.4","version":1,
+           "metadata":{"component":{"type":"library","name":"helix","version":"${HELIX_VERSION}"}},"components":[]}
+          EOF
+        shell: bash
+
+      - name: Upload artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTEFACT }}
+          path: ${{ env.ARTEFACT }}
+
+  # ------------------------------------------------------------------ #
+  #  Checksums + GitHub Release                                         #
+  # ------------------------------------------------------------------ #
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artefacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artefacts/
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd artefacts
+          find . -type f | sort | xargs sha256sum > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Helix ${{ github.ref_name }}"
+          body_path: RELEASE-NOTES-1.0.md
+          files: |
+            artefacts/**/*.tar.xz
+            artefacts/**/*.zip
+            artefacts/SHA256SUMS
+
+  # ------------------------------------------------------------------ #
+  #  Wrapper publish jobs                                               #
+  # ------------------------------------------------------------------ #
+  publish-python:
+    name: Publish Python wrapper
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: Build and publish
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          cd wrappers/python
+          pip install build twine
+          python -m build
+          twine upload dist/*
+
+  publish-rust:
+    name: Publish Rust crate
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          cd wrappers/rust/helix-sys && cargo publish --no-verify
+          cd ../helix              && cargo publish --no-verify
+
+  publish-node:
+    name: Publish Node wrapper
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          cd wrappers/node
+          npm ci
+          npm publish --access public
+
+  publish-dotnet:
+    name: Publish .NET wrapper
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: '8.x' }
+      - name: Pack and push
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          cd wrappers/dotnet
+          dotnet pack -c Release
+          dotnet nuget push **/*.nupkg --api-key "$NUGET_API_KEY" \
+            --source https://api.nuget.org/v3/index.json
+
+  publish-go:
+    name: Tag Go module
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Push Go tag
+        run: |
+          git tag "wrappers/go/${{ github.ref_name }}"
+          git push origin "wrappers/go/${{ github.ref_name }}"
+
+  # ------------------------------------------------------------------ #
+  #  Post-release verification                                          #
+  # ------------------------------------------------------------------ #
+  verify:
+    name: Verify (${{ matrix.label }})
+    needs: release
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: linux,   runner: ubuntu-22.04, slug: linux-x86_64-cpu }
+          - { label: macos,   runner: macos-14,     slug: macos-arm64-metal }
+          - { label: windows, runner: windows-2022, slug: windows-x86_64-cpu }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download + checksum + smoke
+        run: |
+          VERSION="${HELIX_VERSION#v}"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            curl -fsSL -o artefact.zip \
+              "https://github.com/${{ github.repository }}/releases/download/${HELIX_VERSION}/libhelix-${VERSION}-${{ matrix.slug }}.zip"
+            SHA=$(sha256sum artefact.zip | awk '{print $1}')
+            EXPECTED=$(curl -fsSL "https://github.com/${{ github.repository }}/releases/download/${HELIX_VERSION}/SHA256SUMS" | grep "${{ matrix.slug }}" | awk '{print $1}')
+            [ "$SHA" = "$EXPECTED" ] || { echo CHECKSUM MISMATCH; exit 1; }
+            7z x artefact.zip
+            dist/bin/helix-doctor.exe
+          else
+            curl -fsSL -o artefact.tar.xz \
+              "https://github.com/${{ github.repository }}/releases/download/${HELIX_VERSION}/libhelix-${VERSION}-${{ matrix.slug }}.tar.xz"
+            SHA=$(sha256sum artefact.tar.xz | awk '{print $1}')
+            EXPECTED=$(curl -fsSL "https://github.com/${{ github.repository }}/releases/download/${HELIX_VERSION}/SHA256SUMS" | grep "${{ matrix.slug }}" | awk '{print $1}')
+            [ "$SHA" = "$EXPECTED" ] || { echo CHECKSUM MISMATCH; exit 1; }
+            tar xJf artefact.tar.xz
+            dist/bin/helix-doctor
+          fi
+        shell: bash

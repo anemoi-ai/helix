@@ -1,0 +1,12 @@
+build*/
+.cache/
+install/
+test_model/
+test_models/
+*.zip
+*.gguf
+.vs/
+.vscode/
+.idea/
+compile_commands.json
+site/

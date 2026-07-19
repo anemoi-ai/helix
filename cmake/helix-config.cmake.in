@@ -1,0 +1,16 @@
+@PACKAGE_INIT@
+
+include("${CMAKE_CURRENT_LIST_DIR}/helix-targets.cmake")
+
+set_and_check(HELIX_INCLUDE_DIR "@PACKAGE_CMAKE_INSTALL_INCLUDEDIR@")
+set_and_check(HELIX_LIBRARY_DIR "@PACKAGE_CMAKE_INSTALL_LIBDIR@")
+
+set(helix_VERSION @PROJECT_VERSION@)
+
+# Provide the conventional HELIX_FOUND / HELIX_INCLUDE_DIRS / HELIX_LIBRARIES
+# variables alongside the modern helix::helix target.
+set(HELIX_FOUND TRUE)
+set(HELIX_INCLUDE_DIRS "${HELIX_INCLUDE_DIR}")
+get_target_property(HELIX_LIBRARIES helix::helix LOCATION)
+
+check_required_components(helix)

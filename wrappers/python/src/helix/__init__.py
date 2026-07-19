@@ -1,0 +1,73 @@
+"""helix-llm — Python wrapper for libhelix."""
+
+from importlib.metadata import version as _pkg_version
+
+from helix._api import (
+    Helix,
+    Model,
+    Session,
+    AsyncSession,
+    HelixError,
+    HelixInvalidArgError,
+    HelixInvalidJsonError,
+    HelixValidationError,
+    HelixModelNotFoundError,
+    HelixModelLoadFailedError,
+    HelixOomError,
+    HelixVramExhaustedError,
+    HelixContextFullError,
+    HelixCancelledError,
+    HelixBackendError,
+    HelixUnsupportedFeatureError,
+    HelixInternalError,
+    LogLevel,
+    RuntimeOptions,
+    ModelOptions,
+    SessionOptions,
+    ChatCompletion,
+    ChatCompletionChunk,
+    Message,
+    Choice,
+    Delta,
+    Usage,
+    LogprobContent,
+    ToolCall,
+    ToolCallFunction,
+)
+
+try:
+    __version__ = _pkg_version("helix-llm")
+except Exception:
+    __version__ = "0.0.0"
+__all__ = [
+    "Helix",
+    "Model",
+    "Session",
+    "AsyncSession",
+    "HelixError",
+    "HelixInvalidArgError",
+    "HelixInvalidJsonError",
+    "HelixValidationError",
+    "HelixModelNotFoundError",
+    "HelixModelLoadFailedError",
+    "HelixOomError",
+    "HelixVramExhaustedError",
+    "HelixContextFullError",
+    "HelixCancelledError",
+    "HelixBackendError",
+    "HelixUnsupportedFeatureError",
+    "HelixInternalError",
+    "LogLevel",
+    "RuntimeOptions",
+    "ModelOptions",
+    "SessionOptions",
+    "ChatCompletion",
+    "ChatCompletionChunk",
+    "Message",
+    "Choice",
+    "Delta",
+    "Usage",
+    "LogprobContent",
+    "ToolCall",
+    "ToolCallFunction",
+]

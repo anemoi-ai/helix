@@ -1,0 +1,33 @@
+Helix
+Copyright 2024-2026 Anemoi AI
+
+This product includes software developed by third parties under their
+respective open-source licenses:
+
+llama.cpp
+  Copyright (c) 2023-2026 Georgi Gerganov and the llama.cpp contributors
+  License: MIT
+  Source: https://github.com/ggerganov/llama.cpp
+
+nlohmann/json
+  Copyright (c) 2013-2024 Niels Lohmann
+  License: MIT
+  Source: https://github.com/nlohmann/json
+
+stb_image
+  Copyright (c) 2017 Sean Barrett
+  License: MIT / Public Domain
+  Source: https://github.com/nothings/stb
+
+dr_wav / dr_mp3
+  Copyright (c) David Reid
+  License: MIT-0
+  Source: https://github.com/mackron/dr_libs
+
+cpp-httplib (used in helix-shim-server test tool only, not in libhelix)
+  Copyright (c) 2017 yhirose
+  License: MIT
+  Source: https://github.com/yhirose/cpp-httplib
+
+Full license texts are included in the SBOM (share/helix/sbom.cdx.json)
+shipped with each binary artefact.

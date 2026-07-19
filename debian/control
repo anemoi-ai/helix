@@ -1,0 +1,37 @@
+Source: helix
+Section: libs
+Priority: optional
+Maintainer: Helix Team <anemoi_ai@proton.me>
+Build-Depends: debhelper-compat (= 13), cmake (>= 3.22), ninja-build
+Standards-Version: 4.6.2
+Homepage: https://github.com/anemoi-ai/helix
+Rules-Requires-Root: no
+
+Package: libhelix1
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: OpenAI-isomorphic on-device LLM library (runtime)
+ Helix is an embeddable C/C++ shared library that exposes a single-header
+ OpenAI Chat Completions API backed by llama.cpp.  No subprocess, no open
+ ports, no network calls.
+ .
+ This package contains the shared library required at runtime.
+
+Package: libhelix-dev
+Architecture: any
+Section: libdevel
+Depends: libhelix1 (= ${binary:Version}), ${misc:Depends}
+Description: OpenAI-isomorphic on-device LLM library (development files)
+ Helix is an embeddable C/C++ shared library that exposes a single-header
+ OpenAI Chat Completions API backed by llama.cpp.
+ .
+ This package contains the header, pkg-config file, and CMake config needed
+ to build software that links against libhelix.
+
+Package: helix-tools
+Architecture: any
+Section: utils
+Depends: libhelix1 (= ${binary:Version}), ${shlibs:Depends}, ${misc:Depends}
+Description: OpenAI-isomorphic on-device LLM library (tools)
+ This package contains helix-doctor (diagnostic tool) and helix-bench
+ (benchmark harness).

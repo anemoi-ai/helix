@@ -1,0 +1,32 @@
+{
+  "name": "@helix/node",
+  "version": "1.0.0",
+  "description": "Node.js wrapper for libhelix — local LLM inference",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build:native": "node-gyp configure && node-gyp build",
+    "build:ts": "tsc",
+    "build": "npm run build:native && npm run build:ts",
+    "prebuildify": "prebuildify --napi --strip",
+    "test": "vitest run",
+    "lint": "eslint src --ext .ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": ["llm", "inference", "ai", "local", "napi"],
+  "license": "MIT",
+  "files": ["dist", "prebuilds", "binding.gyp", "src/binding.cc"],
+  "gypfile": true,
+  "dependencies": {
+    "node-addon-api": "^8.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0",
+    "@types/node": "^20.0.0",
+    "prebuildify": "^6.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
