@@ -193,6 +193,14 @@ TEST_F(HelixFixture, NCompletionsDeterministicSeed) {
 TEST_F(HelixFixture, SeedDeterminism) {
     std::string extras = "\"seed\":1234";
     auto j1 = run(req("Say hello.", 10, 0.0f, 1, extras));
+    /* Fresh session for the repeat: replaying the same prompt through the
+     * prefix cache re-decodes only the final prompt token, and that different
+     * reduction order can flip a greedy tie. This test is about seeds, not
+     * cache paths (PrefixCacheCorrectness covers those). */
+    helix_session_destroy(sess);
+    sess = nullptr;
+    ASSERT_EQ(helix_session_create(model, R"({"n_ctx":2048})", &sess), HELIX_OK)
+        << helix_last_error_json();
     auto j2 = run(req("Say hello.", 10, 0.0f, 1, extras));
     std::string c1 = j1["choices"][0]["message"]["content"];
     std::string c2 = j2["choices"][0]["message"]["content"];

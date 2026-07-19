@@ -21,23 +21,28 @@ jobs:
           - label: linux-x64-cpu
             runner: ubuntu-latest
             backend: cpu
+            run_unit: true
             run_integration: true
           - label: linux-x64-cuda
             runner: ubuntu-latest
             backend: cuda
+            run_unit: true               # loads via the CUDA driver stub
             run_integration: true
           # Windows x86_64
           - label: windows-x64-cpu
             runner: windows-2022
             backend: cpu
+            run_unit: true
             run_integration: true
           - label: windows-x64-cuda
             runner: windows-2022
             backend: cuda
+            run_unit: false              # binary links nvcuda.dll; no driver
             run_integration: false       # hosted Windows = no NVIDIA GPU
           - label: windows-x64-vulkan
             runner: windows-2022
             backend: vulkan
+            run_unit: true
             run_integration: false       # hosted Windows = no Vulkan GPU
     steps:
       - uses: actions/checkout@v4
@@ -171,7 +176,7 @@ jobs:
 
       # ---- Unit tests ----
       - name: Unit tests (Linux)
-        if: runner.os == 'Linux'
+        if: matrix.run_unit && runner.os == 'Linux'
         run: |
           ctest --test-dir build \
             --output-on-failure \
@@ -179,7 +184,7 @@ jobs:
         env:
           HELIX_BACKEND_CPU: "1"
       - name: Unit tests (Windows)
-        if: runner.os == 'Windows'
+        if: matrix.run_unit && runner.os == 'Windows'
         run: |
           ctest --test-dir build -C Release --output-on-failure
         shell: cmd

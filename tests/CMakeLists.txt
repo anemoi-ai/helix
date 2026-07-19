@@ -101,7 +101,12 @@ if(WIN32)
     target_compile_definitions(helix_unit_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
 
-gtest_discover_tests(helix_unit_tests)
+# PRE_TEST: discovery runs the binary at ctest time, not at build time.
+# GPU-backend builds link the backend runtime (libcuda/nvcuda), which does
+# not exist on driverless CI runners — POST_BUILD discovery would fail the
+# build just trying to load the executable. Cells that cannot load it skip
+# ctest entirely (build-only coverage).
+gtest_discover_tests(helix_unit_tests DISCOVERY_MODE PRE_TEST)
 
 # ------------------------------------------------------------------
 #  Integration tests (require a model; set HELIX_TEST_MODEL env var)
