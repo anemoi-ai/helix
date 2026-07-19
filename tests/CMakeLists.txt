@@ -113,7 +113,12 @@ add_executable(helix_integration_tests
 target_include_directories(helix_integration_tests PRIVATE ${HELIX_TEST_INCLUDES})
 target_link_libraries(helix_integration_tests PRIVATE helix GTest::gtest_main)
 
-gtest_discover_tests(helix_integration_tests
-    PROPERTIES ENVIRONMENT
-        "HELIX_TEST_MODEL=${HELIX_TEST_MODEL}\;HELIX_TEST_EMBED_MODEL=${HELIX_TEST_EMBED_MODEL}\;HELIX_TEST_RERANK_MODEL=${HELIX_TEST_RERANK_MODEL}"
-)
+# Only registered with ctest when a model is provided at configure time;
+# otherwise run the binary directly with HELIX_TEST_MODEL etc. set in the
+# environment (what CI does).
+if(HELIX_TEST_MODEL)
+    gtest_discover_tests(helix_integration_tests
+        PROPERTIES ENVIRONMENT
+            "HELIX_TEST_MODEL=${HELIX_TEST_MODEL}\;HELIX_TEST_EMBED_MODEL=${HELIX_TEST_EMBED_MODEL}\;HELIX_TEST_RERANK_MODEL=${HELIX_TEST_RERANK_MODEL}"
+    )
+endif()
