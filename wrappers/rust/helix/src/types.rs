@@ -99,6 +99,11 @@ pub struct ChatCompletionRequest {
     pub top_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// Reasoning-token budget (helix chat request extension, USER_GUIDE §4.4):
+    /// caps tokens inside the `<think>` block and forces the closing tag once
+    /// spent. `>= -1` (−1 = unbounded). Omitted from the wire when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_budget: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]

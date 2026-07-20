@@ -45,7 +45,7 @@ extern "C" {
  * ------------------------------------------------------------------ */
 
 #define HELIX_ABI_VERSION_MAJOR 1
-#define HELIX_ABI_VERSION_MINOR 6
+#define HELIX_ABI_VERSION_MINOR 7
 #define HELIX_ABI_VERSION_PATCH 0
 
 /* Encoded as (major × 65536 + minor × 256 + patch). */
@@ -53,15 +53,17 @@ extern "C" {
     ((HELIX_ABI_VERSION_MAJOR << 16) | (HELIX_ABI_VERSION_MINOR << 8) | \
      HELIX_ABI_VERSION_PATCH)
 
-/* Compile-time check — verifies the header is the 1.6 stable release.
- * (1.6 adds no symbols — the bump covers the context_shift session option
- * and the "helix" response extension object.) */
+/* Compile-time check — verifies the header is the 1.7 stable release.
+ * (1.7 adds no symbols — the bump covers backward-compatible JSON field
+ * additions: "serializes_decode" in helix_runtime_describe(), "model_hash"
+ * in helix_model_describe(), and "requested"/"limit" on the context_length
+ * error envelope.) */
 #if defined(__cplusplus)
-static_assert(HELIX_ABI_VERSION == 0x00010600,
-    "helix.h: unexpected ABI version — expected 1.6.0 stable (0x00010600)");
+static_assert(HELIX_ABI_VERSION == 0x00010700,
+    "helix.h: unexpected ABI version — expected 1.7.0 stable (0x00010700)");
 #elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
-_Static_assert(HELIX_ABI_VERSION == 0x00010600,
-    "helix.h: unexpected ABI version — expected 1.6.0 stable (0x00010600)");
+_Static_assert(HELIX_ABI_VERSION == 0x00010700,
+    "helix.h: unexpected ABI version — expected 1.7.0 stable (0x00010700)");
 #endif
 
 /* Returns the ABI version the loaded library was built against.

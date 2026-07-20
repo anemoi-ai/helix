@@ -6,6 +6,21 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.7.0] — 2026-07-20
+
+**ABI minor bump: `0x00010700`. No new symbols — the bump covers backward-compatible JSON field additions to existing describe/error payloads.**
+
+### Added
+- `serializes_decode` (bool) in `helix_runtime_describe()` — whether the active backend serialises decodes that share a model through a single GPU queue (CUDA/ROCm). Lets callers decide whether to mirror the serialisation with a decode gate without string-matching backend names.
+- `model_hash` (string) in `helix_model_describe()` — a stable 64-bit FNV-1a content hash of the loaded model's identity (arch, params, size, vocab, layers, embd, trained ctx), for replay/audit chains.
+- `requested` / `limit` (integers) on the `context_length_exceeded` error envelope — the token count that did not fit and the context size, surfaced from the chat prefill and `effective_max_tokens` paths. Omitted when unknown.
+
+### Fixed (Rust wrapper)
+- Re-added the `reasoning_budget` field to `ChatCompletionRequest` (dropped in the 1.6 wrapper); the C ABI already accepts it as a chat request extension.
+- `helix::Error::ContextFull` now carries `requested` / `limit` (`Option<u32>`).
+
+---
+
 ## [1.6.0] — 2026-07-18
 
 **ABI minor bump: `0x00010600`. No new symbols — the bump covers new model/session options and a new response extension object.** Implements F3 and F6 of the 1.4 feature proposal.

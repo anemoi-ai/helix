@@ -6,6 +6,8 @@
 #include "../internal/log.hpp"
 #include "../internal/version.hpp"
 
+#include <cstdio>
+
 /* chat.h declares `using json = nlohmann::ordered_json` at global scope.
  * Include it before our alias so ours wins inside the helix namespace,
  * and use nj to avoid the global collision. */
@@ -443,9 +445,17 @@ uint64_t Model::state_fingerprint() const {
 }
 
 void Model::build_describe() {
+    /* A stable content hash of the loaded model's identity (arch, params, size,
+     * vocab, layers, embd, trained ctx), for replay/audit chains that need to
+     * confirm a completion was produced by the same model (helix ABI 1.7). */
+    char hash_hex[17] = {0};
+    std::snprintf(hash_hex, sizeof(hash_hex), "%016llx",
+                  static_cast<unsigned long long>(state_fingerprint()));
+
     nj j = {
         {"alias",        opts_.alias},
         {"model_path",   opts_.model_path},
+        {"model_hash",   hash_hex},
         {"n_ctx_train",  n_ctx_train()},
         {"n_vocab",      n_vocab()},
         {"n_params",     llama_model_n_params(model_)},

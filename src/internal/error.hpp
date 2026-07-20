@@ -12,6 +12,11 @@ struct Error : std::exception {
     std::string    type;   /* OpenAI error type string */
     std::string    param;  /* offending field name, or "" */
     std::string    code;   /* machine-readable code string */
+    /* Context-length detail (helix ABI 1.7): tokens requested vs the context
+     * limit. -1 means "not applicable / unknown" and is omitted from the wire
+     * envelope. Populated for HELIX_E_CONTEXT_FULL. */
+    int64_t        requested = -1;
+    int64_t        limit     = -1;
 
     Error(helix_status_t s,
           std::string msg,
@@ -51,6 +56,16 @@ const char* last_error_json_ptr();
 [[noreturn]] inline void throw_context_full() {
     throw Error(HELIX_E_CONTEXT_FULL, "prompt + max_tokens exceeds context size",
                 "context_length_exceeded", "max_tokens", "helix_e_context_full");
+}
+/* Context-full with the actual token counts (helix ABI 1.7). `requested` is the
+ * token count that did not fit; `limit` is the context size. */
+[[noreturn]] inline void throw_context_full(int64_t requested, int64_t limit,
+                                            const std::string& msg) {
+    Error e(HELIX_E_CONTEXT_FULL, msg, "context_length_exceeded",
+            "max_tokens", "helix_e_context_full");
+    e.requested = requested;
+    e.limit     = limit;
+    throw e;
 }
 [[noreturn]] inline void throw_model_load_failed(const std::string& path) {
     throw Error(HELIX_E_MODEL_LOAD_FAILED, "failed to load model: " + path,

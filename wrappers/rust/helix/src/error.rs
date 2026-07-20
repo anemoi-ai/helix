@@ -12,6 +12,11 @@ struct ErrorBody {
     message: String,
     #[serde(default)]
     param: Option<String>,
+    /// Context-length detail (helix ABI 1.7): tokens requested vs the limit.
+    #[serde(default)]
+    requested: Option<u32>,
+    #[serde(default)]
+    limit: Option<u32>,
 }
 
 #[derive(Error, Debug)]
@@ -38,7 +43,13 @@ pub enum Error {
     VramExhausted { message: String },
 
     #[error("context full: {message}")]
-    ContextFull { message: String },
+    ContextFull {
+        message: String,
+        /// Tokens requested (helix ABI 1.7; `None` on older libraries).
+        requested: Option<u32>,
+        /// Context-window limit (helix ABI 1.7; `None` on older libraries).
+        limit: Option<u32>,
+    },
 
     #[error("cancelled")]
     Cancelled,
@@ -71,6 +82,8 @@ pub fn check(rc: i32, last_error_json: &str) -> Result<()> {
         .unwrap_or_default();
     let msg = body.message.clone();
     let param = body.param.clone();
+    let requested = body.requested;
+    let limit = body.limit;
 
     // HELIX_E_* constants — mirrored from helix.h
     match rc {
@@ -81,7 +94,7 @@ pub fn check(rc: i32, last_error_json: &str) -> Result<()> {
         -5  => Err(Error::ModelLoadFailed { message: msg }),
         -6  => Err(Error::Oom          { message: msg }),
         -7  => Err(Error::VramExhausted { message: msg }),
-        -8  => Err(Error::ContextFull  { message: msg }),
+        -8  => Err(Error::ContextFull  { message: msg, requested, limit }),
         -9  => Err(Error::Cancelled),
         -10 => Err(Error::Backend      { message: msg }),
         -11 => Err(Error::UnsupportedFeature { message: msg }),

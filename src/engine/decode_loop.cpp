@@ -1133,13 +1133,19 @@ helix_status_t run_chat_completions(Session& sess,
             }
 
             if (n_prompt >= n_ctx_size) {
-                throw Error(HELIX_E_CONTEXT_FULL,
+                {
+                    Error ctx_err(HELIX_E_CONTEXT_FULL,
                             "context_shift could not make the request fit: "
                             "the system prompt + latest user message occupy " +
                             std::to_string(n_prompt) + " of " +
                             std::to_string(n_ctx_size) + " context tokens",
                             "context_length_exceeded", "messages",
                             "helix_e_context_full");
+                    /* helix ABI 1.7: surface the actual token counts. */
+                    ctx_err.requested = n_prompt;
+                    ctx_err.limit     = n_ctx_size;
+                    throw ctx_err;
+                }
             }
             if (prefill_truncated) {
                 prefill_evicted = n_prompt_orig - n_prompt;

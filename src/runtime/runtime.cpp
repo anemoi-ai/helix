@@ -120,9 +120,21 @@ void Runtime::build_describe() {
         if (!already) backends_arr.push_back(name);
     }
 
+    /* Whether the active backend serialises decodes that share a model through
+     * a single GPU queue (CUDA/ROCm). A caller can mirror this with a 1-permit
+     * decode gate to make the queue wait measurable, and route independent
+     * backends (CPU/Metal/Vulkan) without one. Reporting it here means callers
+     * no longer have to string-match backend names (helix ABI 1.7). */
+    bool serializes_decode = false;
+    for (const auto& b : backends_arr) {
+        const std::string name = b.get<std::string>();
+        if (name == "cuda" || name == "rocm") { serializes_decode = true; break; }
+    }
+
     nj j = {
         {"phase",             HELIX_PROGRAM_PHASE},
         {"backends",          backends_arr},
+        {"serializes_decode", serializes_decode},
         {"device_preference", opts_.device_preference},
         {"cpu", {
             {"vendor",             cpu.vendor.empty() ? "unknown" : cpu.vendor},

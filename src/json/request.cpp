@@ -674,7 +674,10 @@ void RerankRequest::validate() const {
 
 int ChatRequest::effective_max_tokens(int ctx_size, int prompt_tokens) const {
     int ceiling = ctx_size - prompt_tokens;
-    if (ceiling <= 0) throw_context_full();
+    if (ceiling <= 0)
+        throw_context_full(prompt_tokens, ctx_size,
+            "prompt (" + std::to_string(prompt_tokens) +
+            " tokens) exceeds context size (" + std::to_string(ctx_size) + ")");
     if (max_completion_tokens) return std::min(*max_completion_tokens, ceiling);
     if (max_tokens)            return std::min(*max_tokens,            ceiling);
     return ceiling; /* unlimited — run to context */
