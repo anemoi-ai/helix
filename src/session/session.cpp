@@ -452,6 +452,24 @@ void Session::release_all() noexcept {
     /* Ordering: spec_mtp_ holds raw pointers into both contexts; ctx_mtp_
      * aliases ctx_ via ctx_other; model_dft_ is the draft model for Branch C.
      * Free in reverse-dependency order. */
+
+    /* Drain any in-flight device work before freeing the contexts. On the
+     * Vulkan/CUDA backends llama_decode() is asynchronous — it submits a batch
+     * to the device queue and returns before the GPU finishes. A cooperative
+     * cancel() breaks out of the decode loop immediately after such a submit,
+     * leaving the last batch mid-submit; a clean (uncancelled) run only avoids
+     * the same hazard by timing luck. Freeing the context — and on Vulkan the
+     * underlying VkDevice/queue/command buffers — while work is still pending is
+     * an out-of-order device teardown that hard-hangs the driver (TDR → bugcheck)
+     * instead of faulting cleanly. See HELIX_R7_CANCEL_TEARDOWN_BUG.md.
+     *
+     * llama_synchronize() blocks until all submitted batches complete; on CPU it
+     * is a no-op. Drain both contexts that own device work, MTP draft first
+     * (ctx_mtp_ shares layers with ctx_ via ctx_other). Also runs on the
+     * constructor's error path, where it is harmless. */
+    if (ctx_mtp_) { llama_synchronize(ctx_mtp_); }
+    if (ctx_)     { llama_synchronize(ctx_);     }
+
     if (spec_mtp_)  { common_speculative_free(spec_mtp_); spec_mtp_  = nullptr; }
     if (ctx_mtp_)   { llama_free(ctx_mtp_);               ctx_mtp_   = nullptr; }
     if (model_dft_) { llama_model_free(model_dft_);       model_dft_ = nullptr; }

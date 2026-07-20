@@ -1267,6 +1267,23 @@ helix_status_t run_chat_completions(Session& sess,
      * rather than leave it describing stale KV. The next request then rebuilds
      * the KV from scratch (text path: lcp==0 ⇒ full seq_rm; multimodal path:
      * KV is cleared before eval_media). */
+    /* Drain in-flight device work after a cancel. cancel() only sets a flag;
+     * the decode loop observes it at the next iteration boundary and breaks,
+     * so the last llama_decode() batch may still be mid-submit on the device
+     * queue (asynchronous on Vulkan/CUDA). Without this drain the session is
+     * not actually reusable despite the "cancelled session stays reusable"
+     * contract — a follow-on request would race that pending batch — and a
+     * subsequent drop would tear the device down with work still in flight
+     * (the SIGSEGV/BSOD in HELIX_R7_CANCEL_TEARDOWN_BUG.md). The destructor
+     * also drains defensively, but draining here keeps the cancelled session
+     * sound for reuse. No-op on CPU. */
+    if (any_cancelled) {
+        if (sess.has_speculative() && sess.ctx_mtp()) {
+            llama_synchronize(sess.ctx_mtp());
+        }
+        llama_synchronize(sess.ctx());
+    }
+
     if (sess.prefix_cache_enabled() && !any_cancelled && !multimodal_prefill_done) {
         if (gen_shifted) {
             /* Generation-time eviction changed the KV contents; decode_one's
