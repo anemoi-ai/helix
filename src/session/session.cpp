@@ -258,14 +258,23 @@ Session::Session(Model& model, const SessionOptions& opts)
     }
 
     // MTP: the target must emit logits for [id_last, draft0..draftN-1] in one
-    // decode (1 + n_max positions). Size the output buffer accordingly and
-    // disable recurrent-state rollback snapshots (the MTP impl manages its own
-    // rollback via pending_h/verify_h).
+    // decode (1 + n_max positions). Size the output buffer accordingly.
+    //
+    // For self-speculation (Branch B) the target model carries the MTP head's
+    // recurrent (nextn) state, which advances across the speculative batch and
+    // must be rewound when drafts are rejected. pending_h/verify_h only roll
+    // back the *draft* context's embeddings — they do nothing for the target's
+    // recurrent state — so enable recurrent-state rollback snapshots sized to
+    // the speculative batch (rejections roll back up to n_max positions).
+    // Without this, seq_rm() on the target's recurrent memory silently fails
+    // (rollback distance > n_rs_seq) and the KV position sticks ahead of n_past,
+    // faulting the next decode under M-RoPE (X < Y). Arch support is gated in
+    // llama_context (QWEN35/QWEN35MOE today); unsupported archs clamp it to 0.
     if (opts_.speculative.type == SpeculativeType::DraftMtp && !opts_.embedding) {
         const uint32_t want = static_cast<uint32_t>(1 + std::max(0, opts_.speculative.n_max));
         ctx_params.n_outputs_max = std::min<uint32_t>(
             ctx_params.n_batch ? ctx_params.n_batch : want, want);
-        ctx_params.n_rs_seq = 0;
+        ctx_params.n_rs_seq = want;
     }
 
     ctx_ = llama_new_context_with_model(model.llama_model_ptr(), ctx_params);
