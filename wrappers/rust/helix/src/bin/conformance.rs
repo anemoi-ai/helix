@@ -3,8 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use helix::{
-    ChatCompletionRequest, Message, ModelOptions, Runtime, RuntimeOptions, LogLevel,
-    SessionOptions,
+    ChatCompletionRequest, LogLevel, Message, ModelOptions, Runtime, RuntimeOptions, SessionOptions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -51,8 +50,7 @@ async fn main() -> anyhow::Result<()> {
     let cases_path = PathBuf::from(&args[1]);
     let model_path = env::var("HELIX_TEST_MODEL_PATH").unwrap_or_default();
     let model_alias = env::var("HELIX_TEST_MODEL").unwrap_or_else(|_| "qwen-test".into());
-    let shim_url = env::var("HELIX_SHIM_URL")
-        .unwrap_or_else(|_| "http://localhost:8080".into());
+    let shim_url = env::var("HELIX_SHIM_URL").unwrap_or_else(|_| "http://localhost:8080".into());
 
     let content = std::fs::read_to_string(&cases_path)?;
     let cases: Cases = serde_yaml::from_str(&content)?;
@@ -77,10 +75,13 @@ async fn run_via_lib(
         log_level: LogLevel::Error,
         ..Default::default()
     })?;
-    let model = runtime.load_model(model_path, ModelOptions {
-        alias: Some(alias.to_string()),
-        ..Default::default()
-    })?;
+    let model = runtime.load_model(
+        model_path,
+        ModelOptions {
+            alias: Some(alias.to_string()),
+            ..Default::default()
+        },
+    )?;
     let session = model.session(SessionOptions::default())?;
 
     let mut results = Vec::new();
@@ -104,9 +105,14 @@ async fn run_case_lib(session: Arc<helix::Session>, case: &Case) -> TestResult {
 
     let mut req: ChatCompletionRequest = match serde_json::from_value(case.request.clone()) {
         Ok(r) => r,
-        Err(e) => return TestResult {
-            name, passed: false, error: Some(format!("bad request: {e}")), detail: Value::Null,
-        },
+        Err(e) => {
+            return TestResult {
+                name,
+                passed: false,
+                error: Some(format!("bad request: {e}")),
+                detail: Value::Null,
+            }
+        }
     };
 
     if case.expect_error.is_some() {
@@ -114,7 +120,11 @@ async fn run_case_lib(session: Arc<helix::Session>, case: &Case) -> TestResult {
         return TestResult {
             name,
             passed: result.is_err(),
-            error: if result.is_ok() { Some("expected error but got success".into()) } else { None },
+            error: if result.is_ok() {
+                Some("expected error but got success".into())
+            } else {
+                None
+            },
             detail: Value::Null,
         };
     }
@@ -136,9 +146,14 @@ async fn run_case_lib(session: Arc<helix::Session>, case: &Case) -> TestResult {
                         }
                     }
                 }
-                Err(e) => return TestResult {
-                    name, passed: false, error: Some(e.to_string()), detail: Value::Null,
-                },
+                Err(e) => {
+                    return TestResult {
+                        name,
+                        passed: false,
+                        error: Some(e.to_string()),
+                        detail: Value::Null,
+                    }
+                }
             }
         }
         drop(stream);
@@ -167,7 +182,10 @@ async fn run_case_lib(session: Arc<helix::Session>, case: &Case) -> TestResult {
                 }),
             },
             Err(e) => TestResult {
-                name, passed: false, error: Some(e.to_string()), detail: Value::Null,
+                name,
+                passed: false,
+                error: Some(e.to_string()),
+                detail: Value::Null,
             },
         }
     }
@@ -195,8 +213,12 @@ async fn run_case_http(
 ) -> TestResult {
     let name = case.name.clone();
     if case.skip_if_no_vision {
-        return TestResult { name, passed: true, error: None,
-            detail: serde_json::json!({"skipped": "no_vision"}) };
+        return TestResult {
+            name,
+            passed: true,
+            error: None,
+            detail: serde_json::json!({"skipped": "no_vision"}),
+        };
     }
     let mut req = case.request.clone();
     if let Some(obj) = req.as_object_mut() {
@@ -210,17 +232,37 @@ async fn run_case_http(
             let body = resp.text().await.unwrap_or_default();
             if !status.is_success() {
                 let passed = case.expect_error.is_some();
-                return TestResult { name, passed,
-                    error: if passed { None } else { Some(format!("HTTP {status}: {}", &body[..body.len().min(200)])) },
-                    detail: Value::Null };
+                return TestResult {
+                    name,
+                    passed,
+                    error: if passed {
+                        None
+                    } else {
+                        Some(format!("HTTP {status}: {}", &body[..body.len().min(200)]))
+                    },
+                    detail: Value::Null,
+                };
             }
             if case.expect_error.is_some() {
-                return TestResult { name, passed: false,
-                    error: Some("expected error but got success".into()), detail: Value::Null };
+                return TestResult {
+                    name,
+                    passed: false,
+                    error: Some("expected error but got success".into()),
+                    detail: Value::Null,
+                };
             }
-            TestResult { name, passed: true, error: None,
-                detail: serde_json::from_str(&body).unwrap_or(Value::Null) }
+            TestResult {
+                name,
+                passed: true,
+                error: None,
+                detail: serde_json::from_str(&body).unwrap_or(Value::Null),
+            }
         }
-        Err(e) => TestResult { name, passed: false, error: Some(e.to_string()), detail: Value::Null },
+        Err(e) => TestResult {
+            name,
+            passed: false,
+            error: Some(e.to_string()),
+            detail: Value::Null,
+        },
     }
 }

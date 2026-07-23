@@ -5,8 +5,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "lowercase")]
 pub enum Message {
-    System { content: String },
-    User { content: MessageContent },
+    System {
+        content: String,
+    },
+    User {
+        content: MessageContent,
+    },
     Assistant {
         #[serde(skip_serializing_if = "Option::is_none")]
         content: Option<String>,
@@ -23,10 +27,14 @@ pub enum Message {
 
 impl Message {
     pub fn user(content: impl Into<String>) -> Self {
-        Message::User { content: MessageContent::Text(content.into()) }
+        Message::User {
+            content: MessageContent::Text(content.into()),
+        }
     }
     pub fn system(content: impl Into<String>) -> Self {
-        Message::System { content: content.into() }
+        Message::System {
+            content: content.into(),
+        }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
         Message::Assistant {
@@ -82,10 +90,16 @@ pub struct ResponseFormat {
 
 impl ResponseFormat {
     pub fn json_object() -> Self {
-        ResponseFormat { format_type: "json_object".into(), json_schema: None }
+        ResponseFormat {
+            format_type: "json_object".into(),
+            json_schema: None,
+        }
     }
     pub fn text() -> Self {
-        ResponseFormat { format_type: "text".into(), json_schema: None }
+        ResponseFormat {
+            format_type: "text".into(),
+            json_schema: None,
+        }
     }
 }
 

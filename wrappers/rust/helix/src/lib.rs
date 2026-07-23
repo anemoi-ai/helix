@@ -28,8 +28,8 @@ async fn main() -> helix::Result<()> {
 */
 
 pub mod error;
-pub mod types;
 pub mod ffi_util;
+pub mod types;
 
 #[cfg(feature = "tokio")]
 mod stream;
@@ -67,10 +67,10 @@ pub enum LogLevel {
 impl LogLevel {
     fn as_u32(&self) -> u32 {
         match self {
-            LogLevel::Off   => 0,
+            LogLevel::Off => 0,
             LogLevel::Error => 1,
-            LogLevel::Warn  => 2,
-            LogLevel::Info  => 3,
+            LogLevel::Warn => 2,
+            LogLevel::Info => 3,
             LogLevel::Debug => 4,
             LogLevel::Trace => 5,
         }
@@ -101,11 +101,21 @@ impl ModelOptions {
     fn to_json(&self, model_path: &str) -> String {
         let mut m = serde_json::Map::new();
         m.insert("model_path".into(), model_path.into());
-        if let Some(a) = &self.alias { m.insert("alias".into(), a.as_str().into()); }
-        if let Some(n) = self.n_gpu_layers { m.insert("n_gpu_layers".into(), n.into()); }
-        if let Some(c) = self.n_ctx { m.insert("n_ctx".into(), c.into()); }
-        if let Some(p) = &self.mmproj_path { m.insert("mmproj_path".into(), p.as_str().into()); }
-        if let Some(r) = &self.reasoning_format { m.insert("reasoning_format".into(), r.as_str().into()); }
+        if let Some(a) = &self.alias {
+            m.insert("alias".into(), a.as_str().into());
+        }
+        if let Some(n) = self.n_gpu_layers {
+            m.insert("n_gpu_layers".into(), n.into());
+        }
+        if let Some(c) = self.n_ctx {
+            m.insert("n_ctx".into(), c.into());
+        }
+        if let Some(p) = &self.mmproj_path {
+            m.insert("mmproj_path".into(), p.as_str().into());
+        }
+        if let Some(r) = &self.reasoning_format {
+            m.insert("reasoning_format".into(), r.as_str().into());
+        }
         serde_json::Value::Object(m).to_string()
     }
 }
@@ -126,7 +136,10 @@ pub struct SpeculativeOptions {
 
 impl SpeculativeOptions {
     pub fn draft_mtp() -> Self {
-        SpeculativeOptions { spec_type: "draft-mtp".into(), ..Default::default() }
+        SpeculativeOptions {
+            spec_type: "draft-mtp".into(),
+            ..Default::default()
+        }
     }
 
     fn to_json_value(&self) -> serde_json::Value {
@@ -137,12 +150,24 @@ impl SpeculativeOptions {
         if let Some(p) = &self.model_path {
             m.insert("model_path".into(), p.clone().into());
         }
-        if let Some(v) = self.n_max { m.insert("n_max".into(), v.into()); }
-        if let Some(v) = self.n_min { m.insert("n_min".into(), v.into()); }
-        if let Some(v) = self.p_min { m.insert("p_min".into(), v.into()); }
-        if let Some(v) = self.backend_sampling { m.insert("backend_sampling".into(), v.into()); }
-        if let Some(v) = &self.cache_type_k { m.insert("cache_type_k".into(), v.clone().into()); }
-        if let Some(v) = &self.cache_type_v { m.insert("cache_type_v".into(), v.clone().into()); }
+        if let Some(v) = self.n_max {
+            m.insert("n_max".into(), v.into());
+        }
+        if let Some(v) = self.n_min {
+            m.insert("n_min".into(), v.into());
+        }
+        if let Some(v) = self.p_min {
+            m.insert("p_min".into(), v.into());
+        }
+        if let Some(v) = self.backend_sampling {
+            m.insert("backend_sampling".into(), v.into());
+        }
+        if let Some(v) = &self.cache_type_k {
+            m.insert("cache_type_k".into(), v.clone().into());
+        }
+        if let Some(v) = &self.cache_type_v {
+            m.insert("cache_type_v".into(), v.clone().into());
+        }
         serde_json::Value::Object(m)
     }
 }
@@ -161,8 +186,12 @@ impl SessionOptions {
             serde_json::Value::Object(m) => m.clone(),
             _ => serde_json::Map::new(),
         };
-        if let Some(c) = self.n_ctx { base.insert("n_ctx".into(), c.into()); }
-        if let Some(s) = self.swa_full { base.insert("swa_full".into(), s.into()); }
+        if let Some(c) = self.n_ctx {
+            base.insert("n_ctx".into(), c.into());
+        }
+        if let Some(s) = self.swa_full {
+            base.insert("swa_full".into(), s.into());
+        }
         if let Some(spec) = &self.speculative {
             let spec_val = spec.to_json_value();
             if let serde_json::Value::Object(m) = spec_val {
@@ -192,9 +221,7 @@ impl Session {
     pub fn chat_completions(&self, req: ChatCompletionRequest) -> Result<ChatCompletion> {
         let req_json = to_cstring(&serde_json::to_string(&req)?)?;
         let mut out: *mut std::os::raw::c_char = ptr::null_mut();
-        let rc = unsafe {
-            sys::helix_chat_completions(self.ptr, req_json.as_ptr(), &mut out)
-        };
+        let rc = unsafe { sys::helix_chat_completions(self.ptr, req_json.as_ptr(), &mut out) };
         error::check(rc, &last_error_json())?;
         let resp_str = unsafe { CStr::from_ptr(out).to_string_lossy().into_owned() };
         unsafe { sys::helix_free(out) };
@@ -244,9 +271,7 @@ impl Model {
     pub fn session(&self, options: SessionOptions) -> Result<Arc<Session>> {
         let opts_json = to_cstring(&options.to_json())?;
         let mut out: *mut sys::helix_session_t = ptr::null_mut();
-        let rc = unsafe {
-            sys::helix_session_create(self.ptr, opts_json.as_ptr(), &mut out)
-        };
+        let rc = unsafe { sys::helix_session_create(self.ptr, opts_json.as_ptr(), &mut out) };
         error::check(rc, &last_error_json())?;
         Ok(Arc::new(Session { ptr: out }))
     }
@@ -293,9 +318,7 @@ impl Runtime {
     }
 
     pub fn describe(&self) -> Result<serde_json::Value> {
-        let s = unsafe {
-            CStr::from_ptr(sys::helix_runtime_describe(self.ptr)).to_string_lossy()
-        };
+        let s = unsafe { CStr::from_ptr(sys::helix_runtime_describe(self.ptr)).to_string_lossy() };
         Ok(serde_json::from_str(&s)?)
     }
 
@@ -304,7 +327,11 @@ impl Runtime {
     }
 
     pub fn version_string(&self) -> String {
-        unsafe { CStr::from_ptr(sys::helix_version_string()).to_string_lossy().into_owned() }
+        unsafe {
+            CStr::from_ptr(sys::helix_version_string())
+                .to_string_lossy()
+                .into_owned()
+        }
     }
 }
 

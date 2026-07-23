@@ -29,7 +29,11 @@ impl HelixStream {
             Ok(s) => s,
             Err(e) => {
                 let _ = tx.send(Err(e.into()));
-                return Box::pin(HelixStream { rx, session, _join: None });
+                return Box::pin(HelixStream {
+                    rx,
+                    session,
+                    _join: None,
+                });
             }
         };
 
@@ -46,16 +50,23 @@ impl HelixStream {
                 return 0;
             }
             let s = CStr::from_ptr(chunk_json).to_string_lossy();
-            let result = serde_json::from_str::<ChatCompletionChunk>(&s)
-                .map_err(|e| Error::Json(e));
+            let result =
+                serde_json::from_str::<ChatCompletionChunk>(&s).map_err(|e| Error::Json(e));
             let closed = state.tx.send(result).is_err();
-            if closed { 1 } else { 0 }
+            if closed {
+                1
+            } else {
+                0
+            }
         }
 
         let handle = tokio::task::spawn_blocking(move || {
             let req_cstr = match to_cstring(&req_json) {
                 Ok(c) => c,
-                Err(e) => { let _ = tx.send(Err(e)); return; }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
             };
             let state = Box::new(CallbackState { tx: tx.clone() });
             let state_ptr = Box::into_raw(state) as *mut std::os::raw::c_void;
@@ -74,13 +85,21 @@ impl HelixStream {
 
             if rc != 0 && rc != -9 {
                 let err_json = unsafe {
-                    CStr::from_ptr(sys::helix_last_error_json()).to_string_lossy().into_owned()
+                    CStr::from_ptr(sys::helix_last_error_json())
+                        .to_string_lossy()
+                        .into_owned()
                 };
-                let _ = error::check(rc, &err_json).map_err(|e| { let _ = tx.send(Err(e)); });
+                let _ = error::check(rc, &err_json).map_err(|e| {
+                    let _ = tx.send(Err(e));
+                });
             }
         });
 
-        Box::pin(HelixStream { rx, session, _join: Some(handle) })
+        Box::pin(HelixStream {
+            rx,
+            session,
+            _join: Some(handle),
+        })
     }
 }
 

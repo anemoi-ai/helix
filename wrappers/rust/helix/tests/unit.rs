@@ -4,7 +4,9 @@ use helix::types::*;
 fn message_user_constructor() {
     let msg = Message::user("hello");
     match msg {
-        Message::User { content: MessageContent::Text(t) } => assert_eq!(t, "hello"),
+        Message::User {
+            content: MessageContent::Text(t),
+        } => assert_eq!(t, "hello"),
         _ => panic!("unexpected variant"),
     }
 }
@@ -84,7 +86,8 @@ fn error_check_validation() {
 #[test]
 fn error_check_model_not_found() {
     use helix::error::{check, Error};
-    let json = r#"{"error":{"message":"not found","type":"not_found_error","param":null,"code":null}}"#;
+    let json =
+        r#"{"error":{"message":"not found","type":"not_found_error","param":null,"code":null}}"#;
     let err = check(-4, json).unwrap_err();
     assert!(matches!(err, Error::ModelNotFound { .. }));
 }

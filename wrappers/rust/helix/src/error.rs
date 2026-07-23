@@ -22,13 +22,19 @@ struct ErrorBody {
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("invalid argument: {message} (param: {param:?})")]
-    InvalidArg { message: String, param: Option<String> },
+    InvalidArg {
+        message: String,
+        param: Option<String>,
+    },
 
     #[error("invalid JSON: {message}")]
     InvalidJson { message: String },
 
     #[error("validation error: {message} (param: {param:?})")]
-    Validation { message: String, param: Option<String> },
+    Validation {
+        message: String,
+        param: Option<String>,
+    },
 
     #[error("model not found: {message}")]
     ModelNotFound { message: String },
@@ -87,18 +93,28 @@ pub fn check(rc: i32, last_error_json: &str) -> Result<()> {
 
     // HELIX_E_* constants — mirrored from helix.h
     match rc {
-        -1  => Err(Error::InvalidArg   { message: msg, param }),
-        -2  => Err(Error::InvalidJson  { message: msg }),
-        -3  => Err(Error::Validation   { message: msg, param }),
-        -4  => Err(Error::ModelNotFound { message: msg }),
-        -5  => Err(Error::ModelLoadFailed { message: msg }),
-        -6  => Err(Error::Oom          { message: msg }),
-        -7  => Err(Error::VramExhausted { message: msg }),
-        -8  => Err(Error::ContextFull  { message: msg, requested, limit }),
-        -9  => Err(Error::Cancelled),
-        -10 => Err(Error::Backend      { message: msg }),
+        -1 => Err(Error::InvalidArg {
+            message: msg,
+            param,
+        }),
+        -2 => Err(Error::InvalidJson { message: msg }),
+        -3 => Err(Error::Validation {
+            message: msg,
+            param,
+        }),
+        -4 => Err(Error::ModelNotFound { message: msg }),
+        -5 => Err(Error::ModelLoadFailed { message: msg }),
+        -6 => Err(Error::Oom { message: msg }),
+        -7 => Err(Error::VramExhausted { message: msg }),
+        -8 => Err(Error::ContextFull {
+            message: msg,
+            requested,
+            limit,
+        }),
+        -9 => Err(Error::Cancelled),
+        -10 => Err(Error::Backend { message: msg }),
         -11 => Err(Error::UnsupportedFeature { message: msg }),
-        -99 => Err(Error::Internal     { message: msg }),
-        n   => Err(Error::Unknown(n)),
+        -99 => Err(Error::Internal { message: msg }),
+        n => Err(Error::Unknown(n)),
     }
 }
