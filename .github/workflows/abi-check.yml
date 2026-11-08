@@ -10,11 +10,27 @@ on:
       - 'helix.def'
       - 'src/**'
       - 'CMakeLists.txt'
+      - '.github/workflows/abi-check.yml'
 
 jobs:
   abi-check:
     name: ABI (${{ matrix.label }})
     runs-on: ${{ matrix.runner }}
+    env:
+      # The whole exported surface: 29 functions. 1.5 was the last ABI minor
+      # to add one; 1.6 and 1.7 changed struct fields only. Kept here, not
+      # read from helix.def / helix.ld, so that adding an export means
+      # editing this check on purpose.
+      HELIX_EXPORTS: >-
+        helix_abi_version helix_chat_completions helix_chat_completions_stream
+        helix_count_tokens helix_embeddings helix_free helix_last_error_json
+        helix_model_describe helix_model_describe_copy helix_model_embedding_dim
+        helix_model_hidden_dim helix_model_load helix_model_load_ex helix_model_release
+        helix_rerank helix_runtime_create helix_runtime_describe
+        helix_runtime_describe_copy helix_runtime_destroy helix_session_cancel
+        helix_session_create helix_session_describe helix_session_destroy
+        helix_session_encode helix_session_restore helix_session_save
+        helix_set_log_callback helix_tokenize helix_version_string
     strategy:
       fail-fast: false
       matrix:
@@ -86,26 +102,19 @@ jobs:
             -new current.dump \
             -strict
 
+      # binutils >= 2.37 prints each symbol as name@@VERSION by default;
+      # --with-symbol-versions makes older nm do the same, so the output has
+      # one shape everywhere. The set check strips the version; the node
+      # check below reads it.
       - name: Verify symbol set (Linux)
         if: runner.os == 'Linux'
         run: |
-          EXPECTED="helix_abi_version helix_chat_completions helix_chat_completions_stream \
-            helix_count_tokens helix_embeddings helix_free helix_last_error_json \
-            helix_model_describe helix_model_describe_copy helix_model_embedding_dim \
-            helix_model_hidden_dim helix_model_load helix_model_load_ex helix_model_release \
-            helix_rerank helix_runtime_create helix_runtime_describe \
-            helix_runtime_describe_copy helix_runtime_destroy helix_session_cancel \
-            helix_session_create helix_session_describe helix_session_destroy \
-            helix_session_encode helix_session_restore helix_session_save \
-            helix_set_log_callback helix_tokenize helix_version_string"
-          ACTUAL=$(nm -D --defined-only build/libhelix.so.1.*.* | awk '{print $3}' | grep '^helix_' | sort)
-          EXPECTED_SORTED=$(echo "$EXPECTED" | tr ' ' '\n' | sort)
-          if [ "$ACTUAL" != "$EXPECTED_SORTED" ]; then
-            echo "FAIL: exported symbol set differs from the 29-symbol 1.5 surface"
-            echo "--- expected ---"
-            echo "$EXPECTED_SORTED"
-            echo "--- actual ---"
-            echo "$ACTUAL"
+          ACTUAL=$(nm -D --defined-only --with-symbol-versions build/libhelix.so.1.*.* |
+                   awk '{print $3}' | grep '^helix_' | sed 's/@.*//' | sort)
+          EXPECTED=$(echo $HELIX_EXPORTS | tr ' ' '\n' | sort)
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "FAIL: exported symbol set differs from the 29-symbol surface"
+            diff <(echo "$EXPECTED") <(echo "$ACTUAL") | sed -n 's/^</  missing:/p; s/^>/  extra:  /p'
             exit 1
           fi
           echo "OK: 29 symbols exactly"
@@ -114,28 +123,31 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           # The frozen HELIX_1.0 node must still carry exactly the original
-          # 16 symbols; each later node adds only its own symbols.
-          V10="helix_abi_version helix_chat_completions helix_chat_completions_stream \
+          # 16 symbols; each later node adds only its own symbols. @@ is the
+          # default version, the one a newly linked binary binds to.
+          BOUND=$(nm -D --defined-only --with-symbol-versions build/libhelix.so.1.*.* |
+                  awk '{print $3}' | grep '^helix_')
+          node() {
+            ver=$1; shift
+            for sym in "$@"; do
+              echo "$BOUND" | grep -qx "${sym}@@HELIX_${ver}" || {
+                echo "FAIL: $sym is not bound to HELIX_${ver}"
+                echo "$BOUND" | grep "^${sym}@" | sed 's/^/  found: /'
+                exit 1
+              }
+            done
+          }
+          node 1.0 helix_abi_version helix_chat_completions helix_chat_completions_stream \
             helix_free helix_last_error_json helix_model_describe helix_model_load \
             helix_model_release helix_runtime_create helix_runtime_describe \
             helix_runtime_destroy helix_session_cancel helix_session_create \
-            helix_session_destroy helix_set_log_callback helix_version_string"
-          V11="helix_embeddings helix_model_embedding_dim"
-          V12="helix_session_describe"
-          V13="helix_runtime_describe_copy helix_model_describe_copy \
-            helix_session_encode helix_model_hidden_dim"
-          V14="helix_count_tokens helix_tokenize helix_model_load_ex"
-          V15="helix_session_save helix_session_restore helix_rerank"
-          DYNSYMS=$(objdump -T build/libhelix.so.1.*.* | grep ' helix_')
-          for node in V10 V11 V12 V13 V14 V15; do
-            eval "syms=\${$node}"
-            ver="${node#V}"
-            ver="HELIX_${ver#0}"
-            for sym in $syms; do
-              echo "$DYNSYMS" | grep -Eq "${ver}  +${sym}\$" || {
-                echo "FAIL: $sym is not bound to ${ver}"; exit 1; }
-            done
-          done
+            helix_session_destroy helix_set_log_callback helix_version_string
+          node 1.1 helix_embeddings helix_model_embedding_dim
+          node 1.2 helix_session_describe
+          node 1.3 helix_runtime_describe_copy helix_model_describe_copy \
+            helix_session_encode helix_model_hidden_dim
+          node 1.4 helix_count_tokens helix_tokenize helix_model_load_ex
+          node 1.5 helix_session_save helix_session_restore helix_rerank
           echo "OK: HELIX_1.0 (16), 1.1 (2), 1.2 (1), 1.3 (4), 1.4 (3), 1.5 (3) nodes correct"
 
       # ============================================================ #
@@ -163,17 +175,29 @@ jobs:
                  Select-Object -First 1
           if (-not $dll) { Write-Error "helix.dll not found"; exit 1 }
 
-          # Use dumpbin to list exports, count the helix_ entries
-          $exports = & dumpbin /exports $dll.FullName |
-                     Select-String -Pattern '^\s+\d+\s+[0-9A-F]+\s+helix_' |
-                     ForEach-Object { ($_.Line -split '\s+')[-1].Trim() }
-          $count = $exports.Count
+          # dumpbin is not on PATH outside a VS developer shell; ask vswhere.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = & $vswhere -latest -products * `
+                       -find "VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" |
+                     Select-Object -First 1
+          if (-not $dumpbin) { Write-Error "dumpbin.exe not found via vswhere"; exit 1 }
 
-          Write-Output "Found $count exported helix_ symbols:"
-          $exports | Sort-Object | ForEach-Object { Write-Output "  $_" }
+          # Export rows are: ordinal, hint, RVA, name.
+          $actual = & $dumpbin /exports $dll.FullName |
+                    Select-String -Pattern '^\s+\d+\s+[0-9A-F]+\s+[0-9A-F]{8}\s+(helix_\w+)\s*$' |
+                    ForEach-Object { $_.Matches[0].Groups[1].Value } | Sort-Object
+          $expected = $env:HELIX_EXPORTS -split '\s+' | Where-Object { $_ } | Sort-Object
 
-          if ($count -ne 29) {
-            Write-Error "Expected 29 helix_ symbols, got $count"
+          Write-Output "Found $($actual.Count) exported helix_ symbols:"
+          $actual | ForEach-Object { Write-Output "  $_" }
+
+          $diff = Compare-Object -ReferenceObject $expected -DifferenceObject @($actual)
+          if ($diff) {
+            $diff | ForEach-Object {
+              $what = if ($_.SideIndicator -eq '<=') { 'missing' } else { 'extra' }
+              Write-Output "  ${what}: $($_.InputObject)"
+            }
+            Write-Error "exported symbol set differs from the 29-symbol surface"
             exit 1
           }
           Write-Output "OK: 29 symbols exactly"
