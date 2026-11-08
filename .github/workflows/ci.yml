@@ -23,8 +23,11 @@ jobs:
             backend: cpu
             run_unit: true
             run_integration: true
+          # Pinned, not ubuntu-latest: nvcc rejects gcc newer than 13, and
+          # ubuntu-latest moved to 26.04 (gcc 15) in 2026-11. 24.04 also
+          # matches the ubuntu2404 CUDA repo installed below.
           - label: linux-x64-cuda
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             backend: cuda
             run_unit: true               # loads via the CUDA driver stub
             run_integration: true
@@ -92,13 +95,19 @@ jobs:
           wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update -q
-          sudo apt-get install -y cuda-toolkit-12-6
+          sudo apt-get install -y cuda-toolkit-12-6 gcc-13 g++-13
           # Hosted runners have no NVIDIA driver, so nothing provides
           # libcuda.so.1 — which gtest_discover_tests needs just to load the
           # test binary at build time. The toolkit's stub satisfies the loader;
           # CUDA init then fails at runtime and helix falls back to CPU.
           sudo ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
           echo "/usr/local/cuda/bin" >> $GITHUB_PATH
+          # CUDA 12.6 supports gcc <= 13. Name it, so the job does not depend
+          # on the image's default: CMake reads CUDAHOSTCXX for nvcc's host
+          # compiler, and CC/CXX keep the host code on the same libstdc++.
+          echo "CC=gcc-13" >> $GITHUB_ENV
+          echo "CXX=g++-13" >> $GITHUB_ENV
+          echo "CUDAHOSTCXX=g++-13" >> $GITHUB_ENV
           echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH" >> $GITHUB_ENV
       # The NVIDIA installer crashes deterministically on hosted runners
       # (exit 3772776473, two runs in a row), so install from NVIDIA's redist
