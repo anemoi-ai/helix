@@ -9,6 +9,7 @@ namespace helix {
 struct RuntimeOptions {
     std::string device_preference = "auto";
     helix_log_level_t log_level   = HELIX_LOG_WARN;
+    bool log_level_set            = false; /* "log_level" given explicitly */
     bool deterministic            = false;
 };
 

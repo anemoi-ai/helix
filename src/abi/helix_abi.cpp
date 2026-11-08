@@ -8,6 +8,7 @@
  */
 
 #include "helix.h"
+#include "../internal/caller_alloc.hpp"
 #include "../internal/error.hpp"
 #include "../internal/log.hpp"
 #include "../internal/version.hpp"
@@ -82,7 +83,13 @@ extern "C" helix_status_t helix_runtime_create(const char* options_json,
     *out_runtime = nullptr;
 
     helix::RuntimeOptions opts = helix::parse_runtime_options(options_json);
-    helix::Logger::instance().min_level.store(opts.log_level, std::memory_order_relaxed);
+    /* Only an explicit "log_level" overrides the logger: a level registered
+     * earlier through helix_set_log_callback must survive a runtime created
+     * without one (the documented setup order registers the callback first). */
+    if (opts.log_level_set) {
+        helix::Logger::instance().min_level.store(opts.log_level,
+                                                  std::memory_order_relaxed);
+    }
 
     *out_runtime = reinterpret_cast<helix_runtime_t*>(
         new helix::Runtime(opts));
@@ -105,15 +112,9 @@ extern "C" const char* helix_runtime_describe(helix_runtime_t* runtime) {
     return reinterpret_cast<helix::Runtime*>(runtime)->describe().c_str();
 }
 
-static char* describe_copy_impl(const std::string& s) {
-    char* p = static_cast<char*>(std::malloc(s.size() + 1));
-    if (p) std::memcpy(p, s.data(), s.size() + 1);
-    return p;
-}
-
 extern "C" char* helix_runtime_describe_copy(helix_runtime_t* runtime) {
-    if (!runtime) return describe_copy_impl("{}");
-    return describe_copy_impl(
+    if (!runtime) return helix::dup_for_caller_nothrow("{}");
+    return helix::dup_for_caller_nothrow(
         reinterpret_cast<helix::Runtime*>(runtime)->describe());
 }
 
@@ -176,8 +177,8 @@ extern "C" const char* helix_model_describe(helix_model_t* model) {
 }
 
 extern "C" char* helix_model_describe_copy(helix_model_t* model) {
-    if (!model) return describe_copy_impl("{}");
-    return describe_copy_impl(
+    if (!model) return helix::dup_for_caller_nothrow("{}");
+    return helix::dup_for_caller_nothrow(
         reinterpret_cast<helix::Model*>(model)->describe());
 }
 
@@ -208,9 +209,16 @@ extern "C" void helix_session_destroy(helix_session_t* session) {
 }
 
 extern "C" char* helix_session_describe(helix_session_t* session) {
-    if (!session) return describe_copy_impl("{}");
-    return describe_copy_impl(
-        reinterpret_cast<helix::Session*>(session)->describe());
+    if (!session) return helix::dup_for_caller_nothrow("{}");
+    /* describe() builds a fresh string (unlike the cached runtime/model
+     * descriptions) and may throw bad_alloc; nothing may escape the C ABI.
+     * The documented failure value is NULL. */
+    try {
+        return helix::dup_for_caller_nothrow(
+            reinterpret_cast<helix::Session*>(session)->describe());
+    } catch (...) {
+        return nullptr;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -247,7 +255,10 @@ extern "C" helix_status_t helix_chat_completions_stream(helix_session_t* session
 
 extern "C" void helix_session_cancel(helix_session_t* session) {
     if (!session) return;
-    reinterpret_cast<helix::Session*>(session)->cancel();
+    try {
+        reinterpret_cast<helix::Session*>(session)->cancel();
+    } catch (...) {
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -369,20 +380,15 @@ extern "C" helix_status_t helix_tokenize(helix_model_t* model,
     const std::string json = reinterpret_cast<helix::Model*>(model)
         ->tokenize_json(text, add_special != 0, parse_special != 0);
 
-    /* Allocated with C malloc() so the caller frees it via helix_free()
-     * (which calls free()). Keep these two paired — see helix_free(). */
-    char* p = static_cast<char*>(std::malloc(json.size() + 1));
-    if (!p) throw std::bad_alloc();
-    std::memcpy(p, json.c_str(), json.size() + 1);
-    *out_tokens_json = p;
+    *out_tokens_json = helix::dup_for_caller(json);
     return HELIX_OK;
     HELIX_CATCH
 }
 
-/* Must stay paired with the allocation in run_chat_completions, which uses
- * the C library's malloc(). If that ever changes to new[]/new, this must change
- * to the matching delete[]/delete in lockstep — crossing the malloc/new heaps
- * (especially across a mismatched Windows CRT) corrupts the heap. */
+/* Must stay paired with dup_for_caller() (internal/caller_alloc.hpp), which
+ * allocates every caller-owned string with the C library's malloc(). If that
+ * ever changes to new[]/new, this must change to the matching delete[]/delete
+ * in lockstep. */
 extern "C" void helix_free(char* ptr) {
     std::free(ptr);
 }

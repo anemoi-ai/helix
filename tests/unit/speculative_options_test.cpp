@@ -308,3 +308,21 @@ TEST(LoraSessionOptions, DuplicateNameThrows) {
                      R"({"lora": [{"name":"a"}, {"name":"a","scale":0.5}]})"),
                  helix::Error);
 }
+
+/* ---- Session options root shape ---- */
+
+TEST(SessionOptions, NonObjectRootRejected) {
+    try {
+        parse_session_options("[1,2]");
+        FAIL() << "expected HELIX_E_INVALID_JSON";
+    } catch (const Error& e) {
+        EXPECT_EQ(e.status, HELIX_E_INVALID_JSON);
+    }
+    EXPECT_THROW(parse_session_options("4096"), Error);
+}
+
+TEST(SessionOptions, NullRootIsDefaults) {
+    auto opts = parse_session_options("null");
+    EXPECT_EQ(opts.n_ctx, 0);
+    EXPECT_TRUE(opts.prefix_cache);
+}

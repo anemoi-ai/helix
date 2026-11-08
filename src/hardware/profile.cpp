@@ -24,22 +24,25 @@ static bool is_full_gpu_offload(const HardwareProfile& hw, const ModelInfo& m) {
     return has_gpu(hw) && m.n_layers > 0 && m.n_gpu_layers >= m.n_layers;
 }
 
+static bool is_partial_gpu_offload(const HardwareProfile& hw, const ModelInfo& m) {
+    return has_gpu(hw) && m.n_layers > 0 && m.n_gpu_layers > 0;
+}
+
+// Partial offload: scale a CPU thread count to the share of CPU-resident layers.
+static uint32_t scale_for_offload(uint32_t full_cpu, const ModelInfo& m) {
+    const double cpu_frac = 1.0 - static_cast<double>(m.n_gpu_layers) / m.n_layers;
+    return std::max(1u, static_cast<uint32_t>(full_cpu * cpu_frac + 0.5));
+}
+
 uint32_t pick_n_threads(const HardwareProfile& hw, const ModelInfo& m) {
     // Full GPU offload: 1 CPU thread is optimal — it only launches kernels.
     if (is_full_gpu_offload(hw, m)) return 1;
 
-    // Partial offload: scale proportionally to CPU-resident layers.
-    if (has_gpu(hw) && m.n_layers > 0 && m.n_gpu_layers > 0) {
-        const double cpu_frac = 1.0 - static_cast<double>(m.n_gpu_layers) / m.n_layers;
-        const CpuInfo& c = hw.cpu;
-        const uint32_t full_cpu = std::min(c.performance_cores, kMaxDecodeThreads);
-        const uint32_t scaled   = static_cast<uint32_t>(full_cpu * cpu_frac + 0.5);
-        return std::max(1u, scaled);
-    }
-
     const CpuInfo& c = hw.cpu;
-    uint32_t n = c.performance_cores;
+    if (is_partial_gpu_offload(hw, m))
+        return scale_for_offload(std::min(c.performance_cores, kMaxDecodeThreads), m);
 
+    uint32_t n;
     if (c.efficiency_cores > 0) {
         n = c.performance_cores;
         if (n < 4) n = std::min(c.physical_cores, 8u);
@@ -49,7 +52,7 @@ uint32_t pick_n_threads(const HardwareProfile& hw, const ModelInfo& m) {
 
     // On small CPUs (<= 4 physical cores), reserve one core for the OS and the
     // caller's own threads so decode does not starve the rest of the process.
-    if (c.physical_cores <= 4) n = std::max(1u, n - 1);
+    if (c.physical_cores <= 4) n = (n > 1) ? n - 1 : 1;
 
     return std::min(n, kMaxDecodeThreads);
 }
@@ -63,18 +66,10 @@ uint32_t pick_n_threads_batch(const HardwareProfile& hw, const ModelInfo& m) {
     // Full GPU offload: 1 thread (kernel launches only).
     if (is_full_gpu_offload(hw, m)) return 1;
 
-    // Partial offload: scale to CPU-resident share.
-    if (has_gpu(hw) && m.n_layers > 0 && m.n_gpu_layers > 0) {
-        const double cpu_frac = 1.0 - static_cast<double>(m.n_gpu_layers) / m.n_layers;
-        const CpuInfo& c = hw.cpu;
-        const uint32_t full_cpu = c.logical_cores;
-        const uint32_t scaled   = static_cast<uint32_t>(full_cpu * cpu_frac + 0.5);
-        return std::max(1u, scaled);
-    }
-
     const CpuInfo& c = hw.cpu;
+    if (is_partial_gpu_offload(hw, m)) return scale_for_offload(c.logical_cores, m);
+
     if (c.isa_tier == IsaTier::AppleM1Plus) return c.performance_cores;
-    if (c.efficiency_cores > 0)             return c.logical_cores;
     return c.logical_cores;
 }
 

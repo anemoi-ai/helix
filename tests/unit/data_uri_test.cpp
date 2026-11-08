@@ -2,6 +2,9 @@
 #include "src/multimodal/image_decode.hpp"
 #include "src/internal/error.hpp"
 
+#include <filesystem>
+#include <fstream>
+
 using namespace helix;
 
 /* Minimal 1×1 transparent PNG, base64-encoded. */
@@ -62,4 +65,73 @@ TEST(AudioDecode, UnsupportedFormatRejected) {
 
 TEST(AudioDecode, EmptyDataRejected) {
     EXPECT_THROW(decode_audio_base64("", "mp3"), helix::Error);
+}
+
+/* ---- file:// percent-decoding ---- */
+
+TEST(FileUri, EncodedNulRejected) {
+    try {
+#ifdef _WIN32
+        load_file_uri("file://C:/tmp/a%00b.png");
+#else
+        load_file_uri("file:///tmp/a%00b.png");
+#endif
+        FAIL() << "expected HELIX_E_VALIDATION";
+    } catch (const Error& e) {
+        EXPECT_EQ(e.status, HELIX_E_VALIDATION);
+        EXPECT_NE(e.message.find("NUL"), std::string::npos) << e.message;
+    }
+}
+
+TEST(FileUri, EncodedTraversalRejected) {
+    try {
+#ifdef _WIN32
+        load_file_uri("file://C:/tmp/%2e%2e/secret");
+#else
+        load_file_uri("file:///tmp/%2e%2e/secret");
+#endif
+        FAIL() << "expected HELIX_E_VALIDATION";
+    } catch (const Error& e) {
+        EXPECT_EQ(e.status, HELIX_E_VALIDATION);
+        EXPECT_NE(e.message.find(".."), std::string::npos) << e.message;
+    }
+}
+
+#ifdef _WIN32
+TEST(FileUri, BackslashTraversalRejected) {
+    try {
+        load_file_uri("file://C:\\tmp\\..\\secret");
+        FAIL() << "expected HELIX_E_VALIDATION";
+    } catch (const Error& e) {
+        EXPECT_EQ(e.status, HELIX_E_VALIDATION);
+        EXPECT_NE(e.message.find(".."), std::string::npos) << e.message;
+    }
+}
+#endif
+
+/* A missing file and an existing-but-rejected file must be indistinguishable
+ * to the caller (no existence oracle). */
+TEST(FileUri, FilesystemFailuresShareOneMessage) {
+    const auto tmp = std::filesystem::temp_directory_path() /
+                     "helix_file_uri_oracle_test.bin";
+    {
+        std::ofstream f(tmp, std::ios::binary);
+        f << "0123456789";
+    }
+    const std::string existing = "file://" + tmp.generic_u8string();
+    const std::string missing = existing + ".does-not-exist";
+
+    std::string msg_missing, msg_too_big;
+    try { load_file_uri(missing); FAIL() << "expected an error"; }
+    catch (const Error& e) { msg_missing = e.message; }
+    try { load_file_uri(existing, /*max_bytes=*/1); FAIL() << "expected an error"; }
+    catch (const Error& e) { msg_too_big = e.message; }
+
+    std::error_code ec;
+    std::filesystem::remove(tmp, ec);
+
+    EXPECT_FALSE(msg_missing.empty());
+    EXPECT_EQ(msg_missing, msg_too_big);
+    EXPECT_EQ(msg_missing.find("helix_file_uri_oracle_test"), std::string::npos)
+        << "message must not echo the resolved path: " << msg_missing;
 }

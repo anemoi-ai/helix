@@ -33,7 +33,7 @@ extern "C" {
 /* ------------------------------------------------------------------
  *  Versioning
  *
- *  HELIX_ABI_VERSION is encoded as (major × 65536 + minor):
+ *  HELIX_ABI_VERSION is encoded as (major × 65536 + minor × 256 + patch):
  *    - Major bump = backward-incompatible change (forbidden during 1.x).
  *    - Minor bump = backward-compatible additions (new symbol, status code,
  *      or JSON field). The 18-month 1.x ABI commitment allows only minor bumps.
@@ -45,20 +45,25 @@ extern "C" {
  * ------------------------------------------------------------------ */
 
 #define HELIX_ABI_VERSION_MAJOR 1
-#define HELIX_ABI_VERSION_MINOR 0
+#define HELIX_ABI_VERSION_MINOR 7
 #define HELIX_ABI_VERSION_PATCH 0
 
-/* Encoded as (major × 65536 + minor). Patch is implicit in the build. */
+/* Encoded as (major × 65536 + minor × 256 + patch). */
 #define HELIX_ABI_VERSION \
-    ((HELIX_ABI_VERSION_MAJOR << 16) | HELIX_ABI_VERSION_MINOR)
+    ((HELIX_ABI_VERSION_MAJOR << 16) | (HELIX_ABI_VERSION_MINOR << 8) | \
+     HELIX_ABI_VERSION_PATCH)
 
-/* Compile-time check — verifies the header is the 1.0 stable release. */
+/* Compile-time check — verifies the header is the 1.7 stable release.
+ * (1.7 adds no symbols — the bump covers backward-compatible JSON field
+ * additions: "serializes_decode" in helix_runtime_describe(), "model_hash"
+ * in helix_model_describe(), and "requested"/"limit" on the context_length
+ * error envelope.) */
 #if defined(__cplusplus)
-static_assert(HELIX_ABI_VERSION == 0x00010000,
-    "helix.h: unexpected ABI version — expected 1.0.0 stable (0x00010000)");
+static_assert(HELIX_ABI_VERSION == 0x00010700,
+    "helix.h: unexpected ABI version — expected 1.7.0 stable (0x00010700)");
 #elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
-_Static_assert(HELIX_ABI_VERSION == 0x00010000,
-    "helix.h: unexpected ABI version — expected 1.0.0 stable (0x00010000)");
+_Static_assert(HELIX_ABI_VERSION == 0x00010700,
+    "helix.h: unexpected ABI version — expected 1.7.0 stable (0x00010700)");
 #endif
 
 /* Returns the ABI version the loaded library was built against.
@@ -88,7 +93,7 @@ static_assert(sizeof(helix_status_t) == 4, "helix_status_t must be 4 bytes");
 #elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 _Static_assert(sizeof(helix_status_t) == 4, "helix_status_t must be 4 bytes");
 #else
-typedef char _helix_status_size_check[sizeof(helix_status_t) == 4 ? 1 : -1];
+typedef char helix_status_size_check_[sizeof(helix_status_t) == 4 ? 1 : -1];
 #endif
 
 enum {
@@ -104,14 +109,23 @@ enum {
     HELIX_E_CANCELLED              = -9,
     HELIX_E_BACKEND                = -10, /* ggml/cuda/metal failure */
     HELIX_E_UNSUPPORTED_FEATURE    = -11,
-    /* -12 … -98 reserved for future 1.x additions */
+    HELIX_E_STATE_MISMATCH         = -12, /* added in 1.5: session state file
+                                             from a different model, n_ctx, or
+                                             incompatible library version */
+    /* -13 … -98 reserved for future 1.x additions */
     HELIX_E_INTERNAL               = -99,
 };
 
 /* Thread-local. Returns a NUL-terminated, OpenAI-shaped JSON error object:
  *   {"error":{"message":..,"type":..,"param":..,"code":..}}
  * Valid until the next helix_* call on this thread.
- * Returns "{}" (never NULL) when no error is set. */
+ * Returns "{}" (never NULL) when no error is set.
+ *
+ * Note: the returned pointer references thread-local storage owned by libhelix.
+ * It remains valid across helix_runtime_destroy / helix_model_release calls,
+ * but NOT across helix_* API calls on the same thread (each call may overwrite
+ * the buffer). Copy the string immediately if you need it to outlive the next
+ * API call. */
 HELIX_API const char* helix_last_error_json(void);
 
 /* ------------------------------------------------------------------
@@ -133,10 +147,14 @@ HELIX_API void helix_runtime_destroy(helix_runtime_t* runtime);
 
 /* Returns the JSON description of what Helix observed about this machine.
  * WARNING: returns a borrowed pointer — valid only while the Runtime lives.
- * Use helix_runtime_describe_copy() for a malloc'd copy you can outlive it. */
+ * Use helix_runtime_describe_copy() for a malloc'd copy you can outlive it.
+ *
+ * NULL-safe: passing NULL returns "{}". */
 HELIX_API const char* helix_runtime_describe(helix_runtime_t* runtime);
 
-/* Returns a malloc'd copy of the runtime description. Caller must helix_free(). */
+/* Returns a malloc'd copy of the runtime description. Caller must helix_free().
+ * May return NULL on malloc failure. NULL-safe: passing NULL returns a copy of
+ * "{}" (or NULL on malloc failure). */
 HELIX_API char* helix_runtime_describe_copy(helix_runtime_t* runtime);
 
 /* ------------------------------------------------------------------
@@ -151,24 +169,55 @@ typedef struct helix_model helix_model_t;
  *
  * This call is synchronous and may take seconds to minutes for large models.
  * There is no built-in timeout or cancellation mechanism; callers that need
- * to keep the UI responsive should call this on a background thread. */
+ * to keep the UI responsive should call this on a background thread, or use
+ * helix_model_load_ex (added in 1.4) for progress reporting + cancellation. */
 HELIX_API helix_status_t helix_model_load(helix_runtime_t* runtime,
                                            const char* model_json,
                                            helix_model_t** out_model);
+
+/* Progress callback for helix_model_load_ex. `progress` is in [0.0, 1.0]
+ * (monotonically non-decreasing; 1.0 is reported before the load returns).
+ * Return 0 to continue loading; return non-zero to cancel — the load then
+ * fails with HELIX_E_CANCELLED and *out_model is set to NULL.
+ *
+ * The callback is invoked synchronously on the thread that called
+ * helix_model_load_ex, during the tensor-loading phase of the model file.
+ * It MUST NOT call back into libhelix (added in 1.4 — export node HELIX_1.4). */
+typedef int (*helix_load_progress_cb)(void* user_data, float progress);
+
+/* As helix_model_load, with an optional progress/cancellation callback.
+ * `cb` may be NULL, making this call exactly equivalent to helix_model_load.
+ * `user_data` is passed through to every `cb` invocation.
+ *
+ * Added in 1.4 — export node HELIX_1.4. */
+HELIX_API helix_status_t helix_model_load_ex(helix_runtime_t* runtime,
+                                             const char* model_json,
+                                             helix_load_progress_cb cb,
+                                             void* user_data,
+                                             helix_model_t** out_model);
 
 /* Releases the model. The caller owns the model's lifetime: it must NOT be
  * released while any session created on it still exists or has an in-flight
  * helix_chat_completions[_stream] call on another thread (doing so races the
  * model teardown against the session's use of it). Destroy all sessions on a
- * model before releasing the model. */
+ * model before releasing the model.
+ *
+ * NULL-safe: passing NULL is a no-op.
+ * Note: this function is also available as helix_model_destroy() for naming
+ * consistency with helix_runtime_destroy / helix_session_destroy. */
 HELIX_API void helix_model_release(helix_model_t* model);
+#define helix_model_destroy helix_model_release
 
 /* JSON describing the loaded model (alias, n_ctx_train, etc.).
  * WARNING: returns a borrowed pointer — valid only while the Model lives.
- * Use helix_model_describe_copy() for a malloc'd copy you can outlive it. */
+ * Use helix_model_describe_copy() for a malloc'd copy you can outlive it.
+ *
+ * NULL-safe: passing NULL returns "{}". */
 HELIX_API const char* helix_model_describe(helix_model_t* model);
 
-/* Returns a malloc'd copy of the model description. Caller must helix_free(). */
+/* Returns a malloc'd copy of the model description. Caller must helix_free().
+ * May return NULL on malloc failure. NULL-safe: passing NULL returns a copy of
+ * "{}" (or NULL on malloc failure). */
 HELIX_API char* helix_model_describe_copy(helix_model_t* model);
 
 /* ------------------------------------------------------------------
@@ -190,6 +239,27 @@ HELIX_API helix_status_t helix_session_create(helix_model_t* model,
 
 HELIX_API void helix_session_destroy(helix_session_t* session);
 
+/* NULL-safe: passing NULL is a no-op. */
+
+/* Returns a malloc'd JSON description of the session's effective context and
+ * speculative state. Caller must helix_free() the result.
+ * NULL-safe: passing NULL returns a copy of "{}" (or NULL on malloc failure).
+ *
+ * Added in 1.2 — export node HELIX_1.2. Example output (flash_attn and
+ * cache_type_k/v added in 1.4):
+ *   {
+ *     "n_ctx": 4096, "n_batch": 512, "n_ubatch": 512,
+ *     "n_threads": 8, "embedding": false, "swa_full": true,
+ *     "flash_attn": true, "cache_type_k": "f16", "cache_type_v": "f16",
+ *     "speculative": {
+ *       "type": "draft-mtp", "enabled": true,
+ *       "n_max": 3, "n_min": 0, "p_min": 0.0,
+ *       "draft_model": true
+ *     }
+ *   }
+ */
+HELIX_API char* helix_session_describe(helix_session_t* session);
+
 /* ------------------------------------------------------------------
  *  Chat Completions — the endpoint
  * ------------------------------------------------------------------ */
@@ -210,20 +280,93 @@ HELIX_API void helix_session_destroy(helix_session_t* session);
  * Calling helix_session_cancel() on the owning session IS safe. */
 typedef int (*helix_stream_cb)(void* user_data, const char* chunk_json);
 
+/* The request body follows the OpenAI Chat Completions schema. In addition,
+ * Helix accepts these extension fields (all optional):
+ *   "top_k"            integer >= 0; top-K filtering (default 40; 0 disables)
+ *   "min_p"            [0, 1]; minimum-probability filtering (default 0.05)
+ *   "repeat_penalty"   > 0; multiplicative repetition penalty over the last
+ *                      64 tokens (default 1.0 = disabled, OpenAI-neutral)
+ *   "reasoning_budget" integer >= -1; cap on <think> tokens for reasoning
+ *                      models. -1/unset = unlimited, 0 = close the thinking
+ *                      block immediately, N > 0 = force the closing tag after
+ *                      N thinking tokens (see docs/USER_GUIDE.md §4.4). */
+
 /* Synchronous form. On success, `*out_response_json` receives a malloc'd,
- * NUL-terminated JSON string; caller must free with `helix_free`. */
+ * NUL-terminated JSON string; caller must free with `helix_free`.
+ * On failure, `*out_response_json` is set to NULL (if the pointer itself is
+ * non-NULL). Inspect helix_last_error_json() for the error details. */
 HELIX_API helix_status_t helix_chat_completions(helix_session_t* session,
                                                  const char* request_json,
                                                  char** out_response_json);
 
-/* Streaming form. Returns once the stream is complete or cancelled. */
+/* Streaming form. Returns once the stream is complete or cancelled.
+ * `on_chunk` must not be NULL; doing so produces HELIX_E_INVALID_ARG. */
 HELIX_API helix_status_t helix_chat_completions_stream(helix_session_t* session,
                                                         const char* request_json,
                                                         helix_stream_cb on_chunk,
                                                         void* user_data);
 
-/* Cooperative cancellation — safe to call from any thread. */
+/* Cooperative cancellation — safe to call from any thread.
+ * Sets a flag checked at the next decode step of any in-flight call on the
+ * session. NULL-safe: passing NULL is a no-op. With no call in flight it is
+ * also a no-op: a cancel never carries over to the next request, and a call
+ * still waiting for the session behind another one is not cancelled.
+ *
+ * What the in-flight call returns depends on where cancellation lands:
+ *
+ *   - Text chat completions (prefill or generation): HELIX_OK with a partial
+ *     response; finish_reason is reported as "stop" (indistinguishable from
+ *     natural completion in the response body).
+ *   - Multimodal chat completions cancelled during media prefill:
+ *     HELIX_E_CANCELLED — there is no meaningful partial response before any
+ *     token has been generated. Once generation has started, behaves like
+ *     text chat (HELIX_OK + partial response).
+ *   - Embeddings (cancelled at an internal batch boundary):
+ *     HELIX_E_CANCELLED — vectors are all-or-nothing; a partial data[] array
+ *     would silently misalign with the input order.
+ *
+ * A cancel-and-retry caller should therefore treat both HELIX_OK-with-partial
+ * and HELIX_E_CANCELLED as "request did not complete" after calling this. */
 HELIX_API void helix_session_cancel(helix_session_t* session);
+
+/* ------------------------------------------------------------------
+ *  Session state persistence (added in 1.5 — export node HELIX_1.5)
+ *
+ *  Persist a chat session's KV cache across process restarts so the next
+ *  request's prefix-cache match skips re-prefilling the saved conversation.
+ *
+ *  SECURITY: state files are TRUSTED input — restore decodes them directly
+ *  into engine buffers. Never restore a file from an untrusted source (the
+ *  same posture as GGUF model files themselves).
+ * ------------------------------------------------------------------ */
+
+/* Serialize the session's KV state and token history to `path` (the file is
+ * written to `path` + ".tmp" first, then atomically renamed). The file embeds
+ * the model's identity fingerprint, n_ctx, and the token history needed for
+ * prefix validation after restore. Typical size: tens to hundreds of MB
+ * (proportional to KV usage).
+ *
+ * Requires a chat session with the prefix cache enabled — restored state is
+ * only reachable through prefix matching, so embedding sessions, speculative
+ * (MTP) sessions, and sessions created with {"prefix_cache": false} are
+ * rejected with HELIX_E_UNSUPPORTED_FEATURE. Waits for any in-flight request
+ * to finish (one-inference-at-a-time rule), then holds the session for the
+ * duration of the save. */
+HELIX_API helix_status_t helix_session_save(helix_session_t* session,
+                                            const char* path);
+
+/* Restore state saved by helix_session_save into a session created on the
+ * same model with the same n_ctx. Fails with HELIX_E_STATE_MISMATCH (-12)
+ * if the file was produced by a different model, a different n_ctx, or an
+ * incompatible library version — or if the file is truncated/corrupt.
+ *
+ * On any failure the session is left empty and usable (as if never
+ * restored). On success the session behaves as if it had just processed the
+ * saved conversation: the next request with a matching prompt prefix reuses
+ * the restored KV instead of re-prefilling. Same session-kind restrictions
+ * as helix_session_save. */
+HELIX_API helix_status_t helix_session_restore(helix_session_t* session,
+                                               const char* path);
 
 /* ------------------------------------------------------------------
  *  Hidden-state extraction (Phase 3)
@@ -241,6 +384,144 @@ HELIX_API helix_status_t helix_session_encode(
 
 /* Returns the hidden dimension of the loaded model. */
 HELIX_API uint32_t helix_model_hidden_dim(helix_model_t* model);
+
+/* ------------------------------------------------------------------
+ *  Embeddings (added in 1.1 — export node HELIX_1.1)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Compute embeddings, following the OpenAI Embeddings API schema.
+ *
+ * The session MUST have been created with {"embedding": true}; calling this
+ * on a chat session returns HELIX_E_UNSUPPORTED_FEATURE (and vice versa:
+ * chat completions on an embedding session are rejected the same way).
+ *
+ * request_json:
+ *   {
+ *     "model": "<alias>",                     // must equal the session's model alias
+ *     "input": "text" | ["text", ...],        // 1..2048 non-empty inputs
+ *     "encoding_format": "float" | "base64"   // optional, default "float"
+ *   }
+ *
+ * On HELIX_OK, *out_response_json receives a malloc-allocated, NUL-terminated
+ * JSON string the caller must release with helix_free():
+ *   {
+ *     "object": "list",
+ *     "data": [ { "object": "embedding", "index": 0,
+ *                 "embedding": [ ... ] | "<base64>" }, ... ],
+ *     "model": "<alias>",
+ *     "usage": { "prompt_tokens": N, "total_tokens": N }
+ *   }
+ *
+ * Vectors are L2-normalized (unit length), matching OpenAI semantics.
+ * data[] order always matches input order. One inference at a time per
+ * session; helix_session_cancel() aborts at the next internal batch boundary
+ * with HELIX_E_CANCELLED.
+ */
+HELIX_API helix_status_t helix_embeddings(
+    helix_session_t* session,
+    const char*      request_json,
+    char**           out_response_json);
+
+/**
+ * Embedding output dimension of the loaded model.
+ *
+ * Returns the pooled output dimension for models usable with
+ * helix_embeddings. NOTE: this is not helix_model_hidden_dim() — the pooled
+ * output dimension diverges from the hidden size for some architectures.
+ *
+ * Returns 0 when the model cannot serve embeddings on this endpoint:
+ * encoder-decoder architectures, or classifier/reranker heads
+ * (pooling type "rank"). Callable on any loaded model; does not require an
+ * embedding session. Intended for dimension negotiation before index
+ * creation (e.g. HNSW dimension locking). NULL-safe: returns 0.
+ */
+HELIX_API uint32_t helix_model_embedding_dim(helix_model_t* model);
+
+/* ------------------------------------------------------------------
+ *  Rerank (added in 1.5 — export node HELIX_1.5)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Rerank documents against a query with a reranker-head model
+ * (e.g. bge-reranker, Qwen3-Reranker). Follows the de-facto /v1/rerank
+ * shape (Cohere/Jina, also implemented by llama-server).
+ *
+ * The session MUST have been created with {"embedding": true,
+ * "pooling": "rank"} on a model with a reranker head; other sessions are
+ * rejected with HELIX_E_UNSUPPORTED_FEATURE (as is helix_embeddings on a
+ * rerank session — rank heads produce scores, not vectors).
+ *
+ * request_json:
+ *   {
+ *     "model": "<alias>",                  // must equal the session's alias
+ *     "query": "...",
+ *     "documents": ["...", ...],           // 1..1024 non-empty strings
+ *     "top_n": 10                          // optional, default: all
+ *   }
+ *
+ * On HELIX_OK, *out_response_json receives a malloc'd, NUL-terminated JSON
+ * string the caller must release with helix_free():
+ *   {
+ *     "object": "list", "model": "<alias>",
+ *     "results": [ {"index": 3, "relevance_score": 4.2}, ... ],
+ *     "usage": {"prompt_tokens": N, "total_tokens": N}
+ *   }
+ *
+ * results[] is sorted by relevance_score descending (ties keep input order);
+ * "index" refers to the position in the request's documents[]. Scores are
+ * the model's raw head outputs (logits, may be negative), matching
+ * llama-server — apply a sigmoid if you need [0, 1] probabilities.
+ *
+ * Each query+document pair must fit the session batch: an oversized pair
+ * fails with HELIX_E_CONTEXT_FULL (param "documents"). One inference at a
+ * time per session; helix_session_cancel() aborts at the next internal
+ * batch boundary with HELIX_E_CANCELLED.
+ */
+HELIX_API helix_status_t helix_rerank(helix_session_t* session,
+                                      const char* request_json,
+                                      char** out_response_json);
+
+/* ------------------------------------------------------------------
+ *  Tokenizer utilities (added in 1.4 — export node HELIX_1.4)
+ * ------------------------------------------------------------------ */
+
+/* Count the tokens the given chat request would occupy after chat-template
+ * rendering — i.e. the "prompt_tokens" the usage object of a real
+ * helix_chat_completions call on this session would report.
+ *
+ * `request_json` accepts the same body as helix_chat_completions (model,
+ * messages, tools, response_format, ...) and is validated the same way;
+ * generation parameters (temperature, max_tokens, stream, ...) are accepted
+ * but have no effect on the count.
+ *
+ * Pure query: does not touch the session KV cache, does not affect the
+ * prefix cache, and is safe to call from any thread — including while a
+ * chat completion is in flight on the same session.
+ *
+ * Limitations (v1): requests containing image/audio content parts return
+ * HELIX_E_UNSUPPORTED_FEATURE (media patch-token counting may be added in a
+ * later release). */
+HELIX_API helix_status_t helix_count_tokens(helix_session_t* session,
+                                            const char* request_json,
+                                            uint32_t* out_token_count);
+
+/* Raw tokenizer access. Tokenizes `text` with the model's own vocabulary and
+ * writes a malloc'd JSON array of token ids ("[1,2,3]"; "[]" for empty text)
+ * to *out_tokens_json; the caller must release it with helix_free().
+ *
+ * `add_special`  non-zero: add the model's special prefix/suffix tokens
+ *                (e.g. BOS), exactly as a chat prompt would receive them.
+ * `parse_special` non-zero: parse special/control token text (e.g.
+ *                "<|im_start|>") into their token ids rather than tokenizing
+ *                them as plain text.
+ *
+ * Pure query: no session required, safe to call from any thread. */
+HELIX_API helix_status_t helix_tokenize(helix_model_t* model,
+                                        const char* text,
+                                        int add_special,
+                                        int parse_special,
+                                        char** out_tokens_json);
 
 /* Free strings returned by helix_chat_completions(). Never free strings
  * returned by helix_*_describe() or helix_last_error_json().
@@ -270,6 +551,14 @@ typedef enum {
     /* Future levels will be appended here with larger values */
 } helix_log_level_t;
 
+#if defined(__cplusplus)
+static_assert(sizeof(helix_log_level_t) == sizeof(int32_t),
+    "helix_log_level_t must be 4 bytes across the C ABI boundary");
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+_Static_assert(sizeof(helix_log_level_t) == sizeof(int32_t),
+    "helix_log_level_t must be 4 bytes across the C ABI boundary");
+#endif
+
 typedef void (*helix_log_cb)(void* user_data,
                               helix_log_level_t level,
                               const char* msg);
@@ -282,10 +571,12 @@ typedef void (*helix_log_cb)(void* user_data,
  * this call returns, subsequent emissions use the new values.
  *
  * Without a registered callback, helix writes ERROR and WARN messages to
- * stderr via fprintf().  In latency-sensitive production environments this
- * blocking I/O occurs on the decode thread and adds jitter.  Register a
- * callback (or pass HELIX_LOG_OFF as min_level) to suppress the default
- * fprintf path.
+ * stderr via fprintf(), and INFO and above to stdout.  In latency-sensitive
+ * production environments this blocking I/O occurs on the decode thread and
+ * adds jitter.  Register a callback (or pass HELIX_LOG_OFF as min_level) to
+ * suppress the default fprintf path.
+ *
+ * Passing cb=NULL restores the default fprintf() behaviour described above.
  *
  * Volume note: at HELIX_LOG_DEBUG and especially HELIX_LOG_TRACE, the
  * underlying inference engine's internal logs are forwarded too — a single

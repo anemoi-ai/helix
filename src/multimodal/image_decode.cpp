@@ -1,10 +1,12 @@
 #include "image_decode.hpp"
 #include "../internal/error.hpp"
+#include "../internal/log.hpp"
 #include "../util/strings.hpp"
 
 #include "base64.hpp"    /* from llama.cpp/common */
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <fstream>
 #include <string>
@@ -17,30 +19,21 @@
 #endif
 
 #if defined(_WIN32)
-#  include <stdlib.h>   // _fullpath, _MAX_PATH
-#  ifndef WIN32_LEAN_AND_MEAN
-#    define WIN32_LEAN_AND_MEAN
-#  endif
-#  ifndef NOMINMAX
-#    define NOMINMAX
-#  endif
-#  include <windows.h>  // CreateFileW, GetFinalPathNameByHandleW
+#  include <stdlib.h>   // _wfullpath
+#  include "../util/win_utf8.hpp"  // windows.h: CreateFileW, GetFinalPathNameByHandleW
 #endif
 
 namespace helix {
 
-#if defined(_WIN32)
-/* UTF-8 → UTF-16 for Win32 wide-char APIs. Returns empty on failure (callers
- * treat an empty result for non-empty input as an error). */
-static std::wstring widen_utf8(const std::string& s) {
-    if (s.empty()) return {};
-    const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
-    if (n <= 0) return {};
-    std::wstring w(static_cast<size_t>(n) - 1, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], n);
-    return w;
+/* Every file:// failure that depends on filesystem state gets the same
+ * client-facing message, so error responses cannot be used to probe which
+ * paths exist. The specific reason is logged for the operator. */
+[[noreturn]] static void throw_file_unreadable(const std::string& detail) {
+    log_warn("file:// image rejected: " + detail);
+    throw_validation("cannot read file:// image (it is missing, unreadable, "
+                     "larger than the size limit, or outside "
+                     "HELIX_FILE_URI_ROOT)", "messages");
 }
-#endif
 
 /* ------------------------------------------------------------------ */
 /*  Data URI — image                                                   */
@@ -111,23 +104,30 @@ std::vector<uint8_t> load_file_uri(const std::string& uri, size_t max_bytes) {
 
     std::string path = uri.substr(kFileScheme.size());
 
-    /* Percent-decode common escapes (%20 → space, etc.) */
+    /* Percent-decode escapes (%20 → space, etc.). Only a '%' followed by
+     * exactly two hex digits is an escape; anything else is kept literally. */
+    auto is_hex = [](char c) {
+        return std::isxdigit(static_cast<unsigned char>(c)) != 0;
+    };
     std::string decoded;
     decoded.reserve(path.size());
     for (size_t i = 0; i < path.size(); ++i) {
-        if (path[i] == '%' && i + 2 < path.size()) {
-            char hex[3] = { path[i+1], path[i+2], '\0' };
-            char* end;
-            long val = std::strtol(hex, &end, 16);
-            if (end == hex + 2) {
-                decoded += static_cast<char>(val);
-                i += 2;
-                continue;
-            }
+        if (path[i] == '%' && i + 2 < path.size() &&
+            is_hex(path[i + 1]) && is_hex(path[i + 2])) {
+            const char hex[3] = { path[i + 1], path[i + 2], '\0' };
+            decoded += static_cast<char>(std::strtol(hex, nullptr, 16));
+            i += 2;
+            continue;
         }
         decoded += path[i];
     }
     path = std::move(decoded);
+
+    /* An embedded NUL (%00) would silently truncate the path at the OS
+     * boundary, so the file opened would not be the one validated here. */
+    if (path.find('\0') != std::string::npos) {
+        throw_validation("file:// URI must not contain NUL bytes", "messages");
+    }
 
     // Absolute-path requirement. Windows drive/UNC paths are accepted on
     // Windows; POSIX absolute paths ("/...") everywhere else.
@@ -148,8 +148,14 @@ std::vector<uint8_t> load_file_uri(const std::string& uri, size_t max_bytes) {
     }
 
     // Reject '..' path components to prevent path traversal attacks.
-    if (path.find("/../") != std::string::npos ||
-        (path.size() >= 3 && path.compare(path.size() - 3, 3, "/..") == 0)) {
+    // Windows also accepts backslash as a separator.
+    std::string sep_norm = path;
+#ifdef _WIN32
+    std::replace(sep_norm.begin(), sep_norm.end(), '\\', '/');
+#endif
+    if (sep_norm.find("/../") != std::string::npos ||
+        (sep_norm.size() >= 3 &&
+         sep_norm.compare(sep_norm.size() - 3, 3, "/..") == 0)) {
         throw_validation(
             "file:// URI must not contain '..' path traversal components",
             "messages");
@@ -158,24 +164,31 @@ std::vector<uint8_t> load_file_uri(const std::string& uri, size_t max_bytes) {
 #if defined(__unix__) || defined(__APPLE__)
     char* resolved = realpath(path.c_str(), nullptr);
     if (!resolved) {
-        throw_validation("cannot resolve file path: " + path, "messages");
+        throw_file_unreadable("cannot resolve file path: " + path);
     }
     std::string canonical_path(resolved);
     free(resolved);
 
+    /* The root is canonicalised like the request path: comparing a
+     * realpath()'d file against a root reached through a symlink (e.g.
+     * macOS /tmp -> /private/tmp) would reject every file. An unresolvable
+     * root is kept verbatim, which fails closed. */
     static const std::string kAllowedBase = []() -> std::string {
         const char* env = std::getenv("HELIX_FILE_URI_ROOT");
         if (!env || env[0] == '\0') return {};
         std::string s(env);
+        if (char* r = realpath(env, nullptr)) {
+            s = r;
+            free(r);
+        }
         if (s.back() != '/') s += '/';
         return s;
     }();
     if (!kAllowedBase.empty()) {
         if (canonical_path != kAllowedBase.substr(0, kAllowedBase.size() - 1) &&
             !starts_with(canonical_path, kAllowedBase)) {
-            throw_validation(
-                "file:// URI resolves outside allowed base directory",
-                "messages");
+            throw_file_unreadable("path resolves outside HELIX_FILE_URI_ROOT: " +
+                                  canonical_path);
         }
     }
     path = std::move(canonical_path);
@@ -187,15 +200,16 @@ std::vector<uint8_t> load_file_uri(const std::string& uri, size_t max_bytes) {
     // pure lexical checks cannot guarantee). Reading through the same handle
     // that was jail-checked also avoids a check/open race. The prefix compare
     // is case-insensitive to match the filesystem.
-    char resolved[_MAX_PATH];
-    if (!_fullpath(resolved, path.c_str(), _MAX_PATH)) {
-        throw_validation("cannot resolve file path: " + path, "messages");
+    /* Wide API throughout: the narrow _fullpath interprets bytes in the ANSI
+     * code page (mangling UTF-8) and is capped at _MAX_PATH. */
+    const std::wstring wide_in = widen_utf8(path);
+    wchar_t* resolved_w = wide_in.empty()
+        ? nullptr : _wfullpath(nullptr, wide_in.c_str(), 0);
+    if (!resolved_w) {
+        throw_file_unreadable("cannot resolve file path: " + path);
     }
-
-    const std::wstring wide_path = widen_utf8(resolved);
-    if (wide_path.empty()) {
-        throw_validation("cannot resolve file path: " + path, "messages");
-    }
+    const std::wstring wide_path(resolved_w);
+    free(resolved_w);
 
     struct HandleGuard {
         HANDLE h;
@@ -204,13 +218,22 @@ std::vector<uint8_t> load_file_uri(const std::string& uri, size_t max_bytes) {
                         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
                         nullptr)};
     if (guard.h == INVALID_HANDLE_VALUE) {
-        throw_validation("cannot open file: " + path, "messages");
+        throw_file_unreadable("cannot open file: " + path);
     }
 
+    /* Read the variable as UTF-16 directly: getenv() returns it in the ANSI
+     * code page, which widen_utf8 would misdecode for non-ASCII roots. */
     static const std::wstring kAllowedBase = []() -> std::wstring {
-        const char* env = std::getenv("HELIX_FILE_URI_ROOT");
-        if (!env || env[0] == '\0') return {};
-        std::wstring w = widen_utf8(env);
+        const wchar_t* name = L"HELIX_FILE_URI_ROOT";
+        std::wstring w;
+        DWORD need = GetEnvironmentVariableW(name, nullptr, 0);
+        while (need > 1) {
+            w.assign(need, L'\0');
+            const DWORD got = GetEnvironmentVariableW(name, &w[0], need);
+            if (got < need) { w.resize(got); break; }
+            need = got; /* grew between the two calls; retry */
+        }
+        if (w.empty()) return {};
         for (auto& c : w) {
             if (c == L'/') c = L'\\';
         }
@@ -221,15 +244,13 @@ std::vector<uint8_t> load_file_uri(const std::string& uri, size_t max_bytes) {
         DWORD need = GetFinalPathNameByHandleW(guard.h, nullptr, 0,
                                                FILE_NAME_NORMALIZED);
         if (need == 0) {
-            throw_validation("cannot resolve final file path: " + path,
-                             "messages");
+            throw_file_unreadable("cannot resolve final file path: " + path);
         }
         std::wstring final_path(need, L'\0');
         DWORD len = GetFinalPathNameByHandleW(guard.h, &final_path[0], need,
                                               FILE_NAME_NORMALIZED);
         if (len == 0 || len >= need) {
-            throw_validation("cannot resolve final file path: " + path,
-                             "messages");
+            throw_file_unreadable("cannot resolve final file path: " + path);
         }
         final_path.resize(len);
         /* Strip the extended-length prefix: "\\?\C:\..." / "\\?\UNC\srv\..." */
@@ -246,22 +267,19 @@ std::vector<uint8_t> load_file_uri(const std::string& uri, size_t max_bytes) {
                                  static_cast<int>(kAllowedBase.size()),
                                  /*bIgnoreCase=*/TRUE) == CSTR_EQUAL;
         if (!inside) {
-            throw_validation(
-                "file:// URI resolves outside allowed base directory",
-                "messages");
+            throw_file_unreadable("path resolves outside HELIX_FILE_URI_ROOT: " +
+                                  path);
         }
     }
 
     /* Read via the already-vetted handle. */
     LARGE_INTEGER fsize;
     if (!GetFileSizeEx(guard.h, &fsize) || fsize.QuadPart < 0) {
-        throw_validation("cannot stat file: " + path, "messages");
+        throw_file_unreadable("cannot stat file: " + path);
     }
     if (static_cast<uint64_t>(fsize.QuadPart) > max_bytes) {
-        throw_validation(
-            "file exceeds max size of " +
-            std::to_string(max_bytes / (1024 * 1024)) + " MiB: " + path,
-            "messages");
+        throw_file_unreadable("file exceeds max size of " +
+                              std::to_string(max_bytes) + " bytes: " + path);
     }
     std::vector<uint8_t> wbuf(static_cast<size_t>(fsize.QuadPart));
     size_t off = 0;
@@ -271,7 +289,7 @@ std::vector<uint8_t> load_file_uri(const std::string& uri, size_t max_bytes) {
         DWORD got = 0;
         if (!ReadFile(guard.h, wbuf.data() + off, chunk, &got, nullptr) ||
             got == 0) {
-            throw_validation("failed to read file: " + path, "messages");
+            throw_file_unreadable("failed to read file: " + path);
         }
         off += got;
     }
@@ -281,24 +299,22 @@ std::vector<uint8_t> load_file_uri(const std::string& uri, size_t max_bytes) {
 #if !defined(_WIN32)
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) {
-        throw_validation("cannot open file: " + path, "messages");
+        throw_file_unreadable("cannot open file: " + path);
     }
 
     const std::streamsize size = f.tellg();
     if (size < 0) {
-        throw_validation("cannot stat file: " + path, "messages");
+        throw_file_unreadable("cannot stat file: " + path);
     }
     if (static_cast<size_t>(size) > max_bytes) {
-        throw_validation(
-            "file exceeds max size of " +
-            std::to_string(max_bytes / (1024 * 1024)) + " MiB: " + path,
-            "messages");
+        throw_file_unreadable("file exceeds max size of " +
+                              std::to_string(max_bytes) + " bytes: " + path);
     }
 
     f.seekg(0);
     std::vector<uint8_t> buf(static_cast<size_t>(size));
     if (!f.read(reinterpret_cast<char*>(buf.data()), size)) {
-        throw_validation("failed to read file: " + path, "messages");
+        throw_file_unreadable("failed to read file: " + path);
     }
     return buf;
 #endif

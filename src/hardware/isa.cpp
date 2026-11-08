@@ -83,24 +83,27 @@ IsaTier detect_isa_tier() {
 
     if (!has_avx2) return IsaTier::Generic;
 
+    // AMX: needs XSAVE state support (bits 17+18 in XCR0). Checked before
+    // AVX-512 because every AMX part also has AVX-512 — the higher tier must
+    // win or it is unreachable.
+    bool amx_enabled = (xcr0 & 0x60000u) == 0x60000u;
+    if (has_amx_tile && amx_enabled) return IsaTier::Amx;
+
     // AVX-512: need F + BW + VL for useful matmul.
     bool avx512_ok = has_avx512f && has_avx512bw && has_avx512vl;
     if (avx512_ok) {
-        // Verify OS enabled AVX-512 state (bits 5+6 in XCR0: opmask + ZMM_hi).
+        // Verify OS enabled AVX-512 state (XCR0 bits 5-7: opmask, ZMM_Hi256,
+        // Hi16_ZMM).
         bool avx512_enabled = (xcr0 & 0xE0u) == 0xE0u;
         if (avx512_enabled) return IsaTier::Avx512;
     }
-
-    // AMX: needs XSAVE state support (bits 17+18 in XCR0).
-    bool amx_enabled = (xcr0 & 0x60000u) == 0x60000u;
-    if (has_amx_tile && amx_enabled) return IsaTier::Amx;
 
     return IsaTier::Avx2;
 
 #elif defined(HELIX_ARCH_ARM64)
 
 #  if defined(__APPLE__)
-    // Apple: treat all M-series as AppleM1Plus (sysctl check in cpu_macos.cpp).
+    // Apple: treat all arm64 Macs (M-series) as AppleM1Plus.
     return IsaTier::AppleM1Plus;
 #  elif defined(__linux__)
     unsigned long hwcap  = getauxval(AT_HWCAP);

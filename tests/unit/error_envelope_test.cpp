@@ -72,3 +72,29 @@ TEST(ErrorException, ThrowAndCatch) {
     }
     EXPECT_EQ(captured, HELIX_E_UNSUPPORTED_FEATURE);
 }
+
+/* The error path runs inside HELIX_CATCH: serialising a message that is not
+ * valid UTF-8 (e.g. a JSON parse error echoing the offending input bytes)
+ * must not throw, or the exception escapes the extern "C" boundary. */
+TEST(ErrorEnvelope, InvalidUtf8MessageDoesNotThrow) {
+    const std::string bad = std::string("bad byte: ") + '\xff' + '\xfe';
+    EXPECT_NO_THROW(set_last_error(HELIX_E_INVALID_JSON, bad,
+                                   "invalid_request_error", "", "helix_e_invalid_json"));
+    json j;
+    ASSERT_NO_THROW(j = json::parse(last_error_json_ptr()));
+    const std::string msg = j["error"]["message"].get<std::string>();
+    EXPECT_EQ(msg.rfind("bad byte: ", 0), 0u);
+    EXPECT_NE(msg.find("\xEF\xBF\xBD"), std::string::npos);  /* U+FFFD */
+}
+
+TEST(ErrorEnvelope, ParseErrorOfInvalidUtf8InputIsReportable) {
+    try {
+        (void)json::parse(std::string("{\"model\":\"") + '\xff' + "\"}");
+        FAIL() << "expected a parse error";
+    } catch (const json::parse_error& e) {
+        EXPECT_NO_THROW(set_last_error(HELIX_E_INVALID_JSON, e.what(),
+                                       "invalid_request_error", "",
+                                       "helix_e_invalid_json"));
+        EXPECT_NO_THROW((void)json::parse(last_error_json_ptr()));
+    }
+}

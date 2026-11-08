@@ -49,8 +49,9 @@ const char* last_error_json_ptr();
 [[noreturn]] inline void throw_validation(const std::string& msg, const std::string& param = "") {
     throw Error(HELIX_E_VALIDATION, msg, "invalid_request_error", param, "helix_e_validation");
 }
-[[noreturn]] inline void throw_unsupported(const std::string& feature, const std::string& param = "") {
-    throw Error(HELIX_E_UNSUPPORTED_FEATURE, feature + " is not supported in this build",
+/* `msg` is the complete user-facing sentence. */
+[[noreturn]] inline void throw_unsupported(const std::string& msg, const std::string& param = "") {
+    throw Error(HELIX_E_UNSUPPORTED_FEATURE, msg,
                 "unsupported_feature_error", param, "helix_e_unsupported_feature");
 }
 [[noreturn]] inline void throw_context_full() {
@@ -60,16 +61,32 @@ const char* last_error_json_ptr();
 /* Context-full with the actual token counts (helix ABI 1.7). `requested` is the
  * token count that did not fit; `limit` is the context size. */
 [[noreturn]] inline void throw_context_full(int64_t requested, int64_t limit,
-                                            const std::string& msg) {
+                                            const std::string& msg,
+                                            const std::string& param = "max_tokens") {
     Error e(HELIX_E_CONTEXT_FULL, msg, "context_length_exceeded",
-            "max_tokens", "helix_e_context_full");
+            param, "helix_e_context_full");
     e.requested = requested;
     e.limit     = limit;
     throw e;
 }
-[[noreturn]] inline void throw_model_load_failed(const std::string& path) {
-    throw Error(HELIX_E_MODEL_LOAD_FAILED, "failed to load model: " + path,
-                "model_load_error", "model_path", "helix_e_model_load_failed");
+[[noreturn]] inline void throw_model_load_failed(const std::string& msg,
+                                                 const std::string& param = "model_path") {
+    throw Error(HELIX_E_MODEL_LOAD_FAILED, msg,
+                "model_load_failed", param, "helix_e_model_load_failed");
+}
+[[noreturn]] inline void throw_model_not_found(const std::string& msg,
+                                               const std::string& param = "model") {
+    throw Error(HELIX_E_MODEL_NOT_FOUND, msg,
+                "model_not_found", param, "helix_e_model_not_found");
+}
+[[noreturn]] inline void throw_backend(const std::string& msg, const std::string& param = "") {
+    throw Error(HELIX_E_BACKEND, msg, "backend_error", param, "helix_e_backend");
+}
+[[noreturn]] inline void throw_cancelled(const std::string& msg) {
+    throw Error(HELIX_E_CANCELLED, msg, "request_cancelled", "", "helix_e_cancelled");
+}
+[[noreturn]] inline void throw_internal(const std::string& msg, const std::string& param = "") {
+    throw Error(HELIX_E_INTERNAL, msg, "internal_error", param, "helix_e_internal");
 }
 
 } // namespace helix

@@ -58,3 +58,36 @@ Out-of-scope:
 - Performance issues or crashes caused by running out of VRAM/RAM with
   valid but very large models.
 - `helix-shim-server` (a test tool, not a supported API surface).
+
+## Hardening notes for hosts that accept untrusted requests
+
+Helix runs inside your process and trusts the request JSON it is given. If the
+messages come from end users, keep the following in mind.
+
+### Special tokens in message content
+
+Helix renders the whole conversation through the model's chat template and
+tokenizes the result as one string with special-token parsing on, matching
+llama.cpp's `llama-server`. Once rendered, user text can no longer be told
+apart from the template's own markup, so control-token text inside a message
+(for example `<|im_end|>`, `<|im_start|>system`, `<|eot_id|>`) is tokenized
+as the real control token rather than as plain text. A user can use this to
+close their own turn early and forge system, assistant or tool turns.
+
+This is a prompt-injection risk, not a memory-safety issue. If your host
+forwards untrusted text, strip or escape the model's special-token strings
+from user-supplied content before building the request. The model's special
+tokens are listed in its GGUF tokenizer metadata. To check a string, call
+`helix_tokenize` on it twice, once with `parse_special` set to 1 and once
+with it set to 0; if the first call returns fewer tokens, the string contains
+special-token text.
+
+### `file://` image URLs
+
+Image parts may reference a local file with a `file:///absolute/path` URL.
+Without `HELIX_FILE_URI_ROOT` set, any file the process can read may be
+referenced. Set `HELIX_FILE_URI_ROOT` to the directory images may be read
+from, or reject `file://` URLs in your host before calling Helix. Files are
+only read for sessions whose model was loaded with an `mmproj_path`; every
+failure to read one is reported with the same message, so error responses do
+not reveal whether a path exists.

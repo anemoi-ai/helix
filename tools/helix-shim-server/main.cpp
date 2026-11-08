@@ -203,9 +203,14 @@ int main(int argc, char** argv) {
     svr.Post("/v1/chat/completions", handle_completions);
 
     svr.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
-        std::string body = "{\"object\":\"list\",\"data\":[{\"id\":\"" +
-                           g_alias + "\",\"object\":\"model\",\"owned_by\":\"helix\"}]}";
-        res.set_content(body, "application/json");
+        nj body = {
+            {"object", "list"},
+            {"data", nj::array({{{"id", g_alias},
+                                 {"object", "model"},
+                                 {"owned_by", "helix"}}})},
+        };
+        res.set_content(body.dump(-1, ' ', false, nj::error_handler_t::replace),
+                        "application/json");
     });
 
     fprintf(stderr, "[helix-shim-server] Listening on %s:%d\n", host, port);

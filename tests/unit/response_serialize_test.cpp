@@ -113,3 +113,37 @@ TEST(ChunkSerialize, UsageChunk) {
     EXPECT_EQ(j["choices"].size(), 0u);
     EXPECT_EQ(j["usage"]["total_tokens"], 15);
 }
+
+/* Byte-level BPE vocabularies split multi-byte characters across tokens, so
+ * a logprob "token" string is routinely a partial UTF-8 sequence. It must
+ * serialise (lossily, with U+FFFD) while "bytes" keeps the exact bytes. */
+TEST(ResponseSerialize, PartialUtf8LogprobTokenSerialises) {
+    auto resp = make_simple_response();
+    TokenLogprobEntry e;
+    e.token   = "\xE2\x82";  /* first two bytes of U+20AC */
+    e.bytes   = {0xE2, 0x82};
+    e.logprob = -0.5f;
+    TokenLogprobAlt alt;
+    alt.token = "\xF0\x9F";
+    alt.bytes = {0xF0, 0x9F};
+    e.top_logprobs.push_back(alt);
+    ChoiceLogprobs lp;
+    lp.content.push_back(e);
+    resp.choices[0].logprobs = lp;
+
+    std::string s;
+    ASSERT_NO_THROW(s = resp.to_json());
+    auto j = json::parse(s);
+    const auto& tok = j["choices"][0]["logprobs"]["content"][0];
+    EXPECT_EQ(tok["bytes"], json::array({0xE2, 0x82}));
+    EXPECT_NE(tok["token"].get<std::string>().find("\xEF\xBF\xBD"),
+              std::string::npos);
+}
+
+TEST(ResponseSerialize, PartialUtf8ChunkSerialises) {
+    DeltaContent d;
+    d.content = std::string("ok ") + '\xC3';
+    std::string s;
+    ASSERT_NO_THROW(s = make_chunk_json("id", 1, "m", "fp", 0, d));
+    EXPECT_NO_THROW((void)json::parse(s));
+}

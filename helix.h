@@ -308,7 +308,9 @@ HELIX_API helix_status_t helix_chat_completions_stream(helix_session_t* session,
 
 /* Cooperative cancellation — safe to call from any thread.
  * Sets a flag checked at the next decode step of any in-flight call on the
- * session. NULL-safe: passing NULL is a no-op.
+ * session. NULL-safe: passing NULL is a no-op. With no call in flight it is
+ * also a no-op: a cancel never carries over to the next request, and a call
+ * still waiting for the session behind another one is not cancelled.
  *
  * What the in-flight call returns depends on where cancellation lands:
  *

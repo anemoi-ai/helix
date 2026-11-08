@@ -5,6 +5,9 @@
 #include "../internal/error.hpp"
 #include "../internal/log.hpp"
 #include "../internal/version.hpp"
+#include "../util/fs_path.hpp"
+#include "../util/json_dump.hpp"
+#include "../util/json_parse.hpp"
 
 #include <cstdio>
 
@@ -30,12 +33,8 @@ ModelOptions parse_model_options(const char* model_json) {
     if (!model_json || model_json[0] == '\0')
         throw_invalid_arg("model_json must not be null or empty");
 
-    nj j;
-    try {
-        j = nj::parse(model_json);
-    } catch (const nj::parse_error& e) {
-        throw_invalid_json(std::string("model options JSON parse error: ") + e.what());
-    }
+    nj j = parse_json_object<nj>(model_json, "model options",
+                                 /*null_is_empty=*/true);
 
     ModelOptions opts;
 
@@ -108,7 +107,7 @@ ModelOptions parse_model_options(const char* model_json) {
                                      "lora");
                 lo.name = e["name"].get<std::string>();
             } else {
-                lo.name = std::filesystem::path(lo.path).stem().string();
+                lo.name = utf8_path(lo.path).stem().u8string();
             }
             /* Names flow into hand-built describe JSON and error messages:
              * keep them to a safe charset rather than escaping downstream. */
@@ -189,26 +188,20 @@ Model::Model(Runtime& rt, const ModelOptions& opts,
              helix_load_progress_cb progress_cb,
              void* progress_user_data) : rt_(rt), opts_(opts) {
     std::error_code ec;
-    if (!std::filesystem::exists(opts.model_path, ec)) {
-        throw Error(HELIX_E_MODEL_NOT_FOUND,
-                    "model file not found: " + opts.model_path,
-                    "model_not_found", "model_path", "helix_e_model_not_found");
+    if (!std::filesystem::exists(utf8_path(opts.model_path), ec)) {
+        throw_model_not_found("model file not found: " + opts.model_path, "model_path");
     }
 
     if (!opts.mmproj_path.empty() &&
-        !std::filesystem::exists(opts.mmproj_path, ec)) {
-        throw Error(HELIX_E_MODEL_NOT_FOUND,
-                    "mmproj file not found: " + opts.mmproj_path,
-                    "model_not_found", "mmproj_path", "helix_e_model_not_found");
+        !std::filesystem::exists(utf8_path(opts.mmproj_path), ec)) {
+        throw_model_not_found("mmproj file not found: " + opts.mmproj_path, "mmproj_path");
     }
 
     /* Adapter files are checked before the (potentially minutes-long) model
      * load so a typo'd path fails fast. */
     for (const auto& lo : opts.lora) {
-        if (!std::filesystem::exists(lo.path, ec)) {
-            throw Error(HELIX_E_MODEL_NOT_FOUND,
-                        "lora adapter file not found: " + lo.path,
-                        "model_not_found", "lora", "helix_e_model_not_found");
+        if (!std::filesystem::exists(utf8_path(lo.path), ec)) {
+            throw_model_not_found("lora adapter file not found: " + lo.path, "lora");
         }
     }
 
@@ -227,9 +220,9 @@ Model::Model(Runtime& rt, const ModelOptions& opts,
         gparams.ctx      = nullptr;
         gguf_context* gctx = gguf_init_from_file(opts.model_path.c_str(), gparams);
         if (!gctx) {
-            throw Error(HELIX_E_MODEL_LOAD_FAILED,
-                        "failed to probe model for metadata (GGUF read failed): " + opts.model_path,
-                        "model_load_failed", "model_path", "helix_e_model_load_failed");
+            throw_model_load_failed("failed to probe model for metadata (GGUF read failed): "
+                                    + opts.model_path,
+                                    "model_path");
         }
         auto get_int = [gctx](const std::string& key) -> int {
             const int64_t idx = gguf_find_key(gctx, key.c_str());
@@ -273,9 +266,16 @@ Model::Model(Runtime& rt, const ModelOptions& opts,
     // ------------------------------------------------------------------
     const HardwareProfile& hw = rt_.profile();
     const int user_req = parse_gpu_layers_request(opts.n_gpu_layers_str);
-    GpuLayerPlan plan  = pick_n_gpu_layers(hw, user_req,
-                                           opts.model_path, total_layers,
-                                           opts.n_ctx > 0 ? opts.n_ctx : (training_ctx > 0 ? training_ctx : 4096));
+    const bool cpu_only = rt_.options().device_preference == "cpu";
+    if (cpu_only && user_req != kGpuLayersAuto && user_req != 0) {
+        log_warn("n_gpu_layers=" + opts.n_gpu_layers_str + " ignored: runtime "
+                 "device_preference is \"cpu\"");
+    }
+    GpuLayerPlan plan  = cpu_only
+        ? GpuLayerPlan{0, false, "runtime device_preference is \"cpu\""}
+        : pick_n_gpu_layers(hw, user_req,
+                            opts.model_path, total_layers,
+                            opts.n_ctx > 0 ? opts.n_ctx : (training_ctx > 0 ? training_ctx : 4096));
     n_gpu_layers_actual_ = plan.n_gpu_layers;
     log_info("gpu layer plan: " + plan.rule);
 
@@ -287,6 +287,7 @@ Model::Model(Runtime& rt, const ModelOptions& opts,
     params.use_mmap     = opts.use_mmap;
     params.use_mlock    = opts.use_mlock;
     params.vocab_only   = opts.vocab_only;
+    apply_device_preference(params);
 
     LoadProgressState progress_state{progress_cb, progress_user_data};
     if (progress_cb) {
@@ -299,71 +300,66 @@ Model::Model(Runtime& rt, const ModelOptions& opts,
     model_ = llama_model_load_from_file(opts.model_path.c_str(), params);
     if (!model_) {
         if (progress_state.cancelled) {
-            throw Error(HELIX_E_CANCELLED,
-                        "model load cancelled by progress callback: " + opts.model_path,
-                        "cancel", "", "helix_e_cancelled");
+            throw_cancelled("model load cancelled by progress callback: " + opts.model_path);
         }
-        throw_model_load_failed(opts.model_path);
+        throw_model_load_failed("failed to load model: " + opts.model_path);
     }
 
-    /* common_chat_templates_init takes a const std::string& — pass empty string
-     * (not nullptr) when there is no override. */
-    auto tmpls_ptr = common_chat_templates_init(model_,
-                                                opts.chat_template_override);
-    if (!tmpls_ptr) {
-        throw Error(HELIX_E_MODEL_LOAD_FAILED,
-                    "failed to initialise chat templates from model: " + opts.model_path,
-                    "model_load_failed", "model_path", "helix_e_model_load_failed");
-    }
-    tmpls_.reset(tmpls_ptr.release());
+    /* Everything after the weights are loaded can still fail (a malformed
+     * chat_template_override, a bad mmproj, a mismatched LoRA). A throwing
+     * constructor skips the destructor, so free the model on every such
+     * path (which also frees any adapters already loaded). */
+    try {
+        /* common_chat_templates_init takes a const std::string& — pass empty
+         * string (not nullptr) when there is no override. */
+        auto tmpls_ptr = common_chat_templates_init(model_,
+                                                    opts.chat_template_override);
+        if (!tmpls_ptr) {
+            throw_model_load_failed("failed to initialise chat templates from model: "
+                                    + opts.model_path,
+                                    "model_path");
+        }
+        tmpls_.reset(tmpls_ptr.release());
 
-    /* Load mmproj if provided. */
-    if (!opts.mmproj_path.empty()) {
-        mmproj_ = std::make_unique<MmProj>(
-            opts.mmproj_path.c_str(),
-            model_,
-            n_gpu_layers_actual_ > 0,
-            0 /* n_threads: 0 = auto */);
-    }
+        /* Load mmproj if provided. */
+        if (!opts.mmproj_path.empty()) {
+            mmproj_ = std::make_unique<MmProj>(
+                opts.mmproj_path.c_str(),
+                model_,
+                n_gpu_layers_actual_ > 0,
+                0 /* n_threads: 0 = auto */);
+        }
 
-    /* LoRA adapters (1.6, F6). Handles are owned by llama and freed with the
-     * model. A constructor throw skips the destructor, so free the model on
-     * the error paths (which also frees any adapters already loaded). */
-    for (const auto& lo : opts.lora) {
-        try {
+        /* LoRA adapters (1.6, F6). Handles are owned by llama and freed with
+         * the model. */
+        for (const auto& lo : opts.lora) {
             log_info("loading lora adapter \"" + lo.name + "\": " + lo.path);
             llama_adapter_lora* adapter =
                 llama_adapter_lora_init(model_, lo.path.c_str());
             if (!adapter) {
-                throw Error(HELIX_E_MODEL_LOAD_FAILED,
-                            "failed to load lora adapter \"" + lo.name + "\" (" +
-                            lo.path + "): not a LoRA GGUF, or its tensors do "
-                            "not match this base model",
-                            "model_load_failed", "lora",
-                            "helix_e_model_load_failed");
+                throw_model_load_failed("failed to load lora adapter \"" + lo.name + "\" (" +
+                                        lo.path + "): not a LoRA GGUF, or its tensors do "
+                                        "not match this base model", "lora");
             }
             /* Activated LoRAs (aLoRA) only apply after their invocation-token
              * sequence appears in the context — semantics the decode loop
              * does not implement. Honest rejection over silent misbehaviour. */
             if (llama_adapter_get_alora_n_invocation_tokens(adapter) > 0) {
-                throw Error(HELIX_E_UNSUPPORTED_FEATURE,
-                            "lora adapter \"" + lo.name + "\" is an activated "
-                            "LoRA (aLoRA), which is not supported in this "
-                            "release",
-                            "unsupported_feature_error", "lora",
-                            "helix_e_unsupported_feature");
+                throw_unsupported("lora adapter \"" + lo.name + "\" is an activated "
+                                  "LoRA (aLoRA), which is not supported in this "
+                                  "release", "lora");
             }
             loras_.push_back({lo.name, lo.path, lo.scale, adapter});
-        } catch (...) {
-            mmproj_.reset();
-            tmpls_.reset();
-            llama_model_free(model_);
-            model_ = nullptr;
-            throw;
         }
-    }
 
-    build_describe();
+        build_describe();
+    } catch (...) {
+        mmproj_.reset();
+        tmpls_.reset();
+        llama_model_free(model_);
+        model_ = nullptr;
+        throw;
+    }
     log_info("model loaded: " + opts.alias);
 }
 
@@ -373,6 +369,14 @@ Model::~Model() {
     if (model_) {
         llama_model_free(model_);
         model_ = nullptr;
+    }
+}
+
+void Model::apply_device_preference(llama_model_params& params) const {
+    static ggml_backend_dev_t kNoOffloadDevices[] = {nullptr};
+    if (rt_.options().device_preference == "cpu") {
+        params.devices      = kNoOffloadDevices;
+        params.n_gpu_layers = 0;
     }
 }
 
@@ -476,7 +480,7 @@ void Model::build_describe() {
                            {"scale", l.scale}});
     }
     j["lora"] = loras_j;
-    describe_json_ = j.dump(2);
+    describe_json_ = dump_json(j, 2);
 }
 
 } // namespace helix

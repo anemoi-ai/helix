@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 #include "../chat/template.hpp"  /* for GrammarTrigger */
@@ -24,7 +25,7 @@ using SamplerPtr = std::unique_ptr<llama_sampler, SamplerDeleter>;
  * Grammar slot is inserted between penalties and top_k, per RFC §6.6.3.
  * logit_biases (phase 6) are applied after grammar, before top_k. */
 SamplerPtr build_sampler_chain(const ChatRequest& req,
-                                unsigned int seed_override = 0,
+                                std::optional<uint32_t> seed_override = std::nullopt,
                                 const llama_vocab* vocab = nullptr,
                                 const std::string& grammar = "",
                                 bool grammar_lazy = false,

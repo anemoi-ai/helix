@@ -166,6 +166,7 @@ CpuInfo probe_cpu() {
 
 #else // not Linux — use fallback
 
+#include <algorithm>
 #include <thread>
 
 namespace helix {

@@ -24,7 +24,7 @@ static AccelBackend classify_backend(const char* reg_name) {
     if (!reg_name) return AccelBackend::Unknown;
     std::string s(reg_name);
     std::transform(s.begin(), s.end(), s.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     if (s.find("cuda") != std::string::npos)   return AccelBackend::Cuda;
     if (s.find("metal") != std::string::npos)  return AccelBackend::Metal;
     if (s.find("vulkan") != std::string::npos) return AccelBackend::Vulkan;

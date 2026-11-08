@@ -184,11 +184,17 @@ TEST(ContentPartParse, NonEmptyTextPartPasses) {
 
 /* ---- file:// URL scheme ---- */
 
-TEST(ContentPartParse, FileUriNonExistentPathRejected) {
+/* Parsing never touches the filesystem: the URI is kept and read only once
+ * the session is known to accept media (decode_loop). */
+TEST(ContentPartParse, FileUriIsNotReadDuringParse) {
     std::string json = R"({"model":"m","messages":[{"role":"user","content":[
         {"type":"image_url","image_url":{"url":"file:///nonexistent/path/image.png"}}
     ]}]})";
-    EXPECT_THROW(parse(json), helix::Error);
+    auto r = parse(json);
+    ASSERT_EQ(r.messages[0].content_parts.size(), 1u);
+    const auto& p = r.messages[0].content_parts[0];
+    EXPECT_EQ(p.media_file_uri, "file:///nonexistent/path/image.png");
+    EXPECT_TRUE(p.media_raw.empty());
 }
 
 /* ---- invalid base64 ---- */

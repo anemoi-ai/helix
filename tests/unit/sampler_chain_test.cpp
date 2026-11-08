@@ -152,7 +152,7 @@ TEST(SamplerChain, WithLogitBiasNoVocab) {
 
 TEST(SamplerChain, WithGrammar) {
     auto req   = make_req(R"({"model":"m","messages":[{"role":"user","content":"x"}]})");
-    auto chain = build_sampler_chain(req, 0, nullptr, "root ::= \"hello\"", false);
+    auto chain = build_sampler_chain(req, std::nullopt, nullptr, "root ::= \"hello\"", false);
     EXPECT_NE(chain.get(), nullptr);
 }
 
@@ -162,7 +162,7 @@ TEST(SamplerChain, WithGrammarLazyAndTriggers) {
         {1, "tool_call", -1},
         {2, "\\d+", -1}
     };
-    auto chain = build_sampler_chain(req, 0, nullptr, "root ::= \"hello\"", true, triggers);
+    auto chain = build_sampler_chain(req, std::nullopt, nullptr, "root ::= \"hello\"", true, triggers);
     EXPECT_NE(chain.get(), nullptr);
 }
 
@@ -171,7 +171,7 @@ TEST(SamplerChain, WithGrammarTriggerTypeToken) {
     std::vector<GrammarTrigger> triggers = {
         {0, "", 42}
     };
-    auto chain = build_sampler_chain(req, 0, nullptr, "root ::= \"hello\"", true, triggers);
+    auto chain = build_sampler_chain(req, std::nullopt, nullptr, "root ::= \"hello\"", true, triggers);
     EXPECT_NE(chain.get(), nullptr);
 }
 
@@ -181,7 +181,7 @@ TEST(SamplerChain, WithGrammarTriggerTypePatternFull) {
         {3, "tool_call", -1},
         {3, "^\\[TOOL_CALL\\]$", -1}
     };
-    auto chain = build_sampler_chain(req, 0, nullptr, "root ::= \"hello\"", true, triggers);
+    auto chain = build_sampler_chain(req, std::nullopt, nullptr, "root ::= \"hello\"", true, triggers);
     EXPECT_NE(chain.get(), nullptr);
 }
 
@@ -197,7 +197,7 @@ TEST(SamplerChain, GreedyWithPenalties) {
 
 TEST(SamplerChain, EmptyGrammarNoVocab) {
     auto req   = make_req(R"({"model":"m","messages":[{"role":"user","content":"x"}]})");
-    auto chain = build_sampler_chain(req, 0, nullptr, "", false);
+    auto chain = build_sampler_chain(req, std::nullopt, nullptr, "", false);
     EXPECT_NE(chain.get(), nullptr);
 }
 
@@ -218,7 +218,7 @@ TEST(SamplerChain, ReasoningBudgetNoVocabDoesNotCrash) {
         "model":"m","messages":[{"role":"user","content":"x"}],
         "reasoning_budget":64
     })");
-    auto chain = build_sampler_chain(req, 0, nullptr, "", false, {}, {},
+    auto chain = build_sampler_chain(req, std::nullopt, nullptr, "", false, {}, {},
                                      req.reasoning_budget.value_or(-1),
                                      "<think>", "</think>",
                                      /*thinking_forced_open=*/false);
@@ -230,7 +230,7 @@ TEST(SamplerChain, ReasoningBudgetZeroNoVocabDoesNotCrash) {
         "model":"m","messages":[{"role":"user","content":"x"}],
         "reasoning_budget":0
     })");
-    auto chain = build_sampler_chain(req, 0, nullptr, "", false, {}, {},
+    auto chain = build_sampler_chain(req, std::nullopt, nullptr, "", false, {}, {},
                                      req.reasoning_budget.value_or(-1),
                                      "<think>", "</think>",
                                      /*thinking_forced_open=*/true);
@@ -241,7 +241,7 @@ TEST(SamplerChain, ReasoningBudgetUnlimitedDoesNotCrash) {
     auto req = make_req(R"({
         "model":"m","messages":[{"role":"user","content":"x"}]
     })");
-    auto chain = build_sampler_chain(req, 0, nullptr, "", false, {}, {},
+    auto chain = build_sampler_chain(req, std::nullopt, nullptr, "", false, {}, {},
                                      req.reasoning_budget.value_or(-1),
                                      "", "</think>",
                                      /*thinking_forced_open=*/false);
@@ -255,7 +255,7 @@ TEST(SamplerChain, ReasoningBudgetEmptyStartTagDoesNotCrash) {
         "model":"m","messages":[{"role":"user","content":"x"}],
         "reasoning_budget":16
     })");
-    auto chain = build_sampler_chain(req, 0, nullptr, "", false, {}, {},
+    auto chain = build_sampler_chain(req, std::nullopt, nullptr, "", false, {}, {},
                                      req.reasoning_budget.value_or(-1),
                                      "", "</think>",
                                      /*thinking_forced_open=*/false);

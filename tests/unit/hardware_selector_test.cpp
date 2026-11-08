@@ -548,3 +548,11 @@ TEST(PickNThreadsEmbed, FullGpuOffloadReturnsOne) {
     mi.n_gpu_layers = 12;
     EXPECT_EQ(pick_n_threads_embed(hw, mi), 1u);
 }
+
+/* A probe that reports zero performance cores must not wrap the small-CPU
+ * "reserve one core" subtraction around to UINT32_MAX (then clamp to 32). */
+TEST(PickNThreads, ZeroPerfCoresOnHybridDoesNotUnderflow) {
+    using namespace helix;
+    auto hw = make_profile(4, 0, 0, 4, IsaTier::Avx2);
+    EXPECT_EQ(pick_n_threads(hw), 1u);
+}

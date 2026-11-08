@@ -1,6 +1,7 @@
 #include "response.hpp"
 #include "base64.hpp"    /* from llama.cpp/common */
 #include "nlohmann/json.hpp"
+#include "../util/json_dump.hpp"
 
 using json = nlohmann::json;
 
@@ -91,7 +92,7 @@ std::string ChatResponse::to_json() const {
             {"evicted_tokens",  evicted_tokens},
         };
     }
-    return j.dump();
+    return dump_json(j);
 }
 
 std::string ChatChunk::to_json() const {
@@ -149,7 +150,7 @@ std::string ChatChunk::to_json() const {
     if (usage) {
         j["usage"] = usage_to_json(*usage);
     }
-    return j.dump();
+    return dump_json(j);
 }
 
 std::string EmbeddingsResponse::to_json() const {
@@ -181,7 +182,7 @@ std::string EmbeddingsResponse::to_json() const {
             {"total_tokens",  prompt_tokens}
         }}
     };
-    return j.dump();
+    return dump_json(j);
 }
 
 std::string make_chunk_json(const std::string& id,
@@ -238,7 +239,7 @@ std::string make_shift_chunk_json(const std::string& id,
         {"helix",              {{"context_shifted", true},
                                 {"evicted_tokens",  evicted_tokens}}},
     };
-    return j.dump();
+    return dump_json(j);
 }
 
 } // namespace helix

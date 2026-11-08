@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'helix.h'
+      - 'wrappers/swift/Sources/CHelix/helix.h'
       - 'helix.ld'
       - 'helix.exp'
       - 'helix.def'
@@ -26,6 +27,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      # The Swift package vends its own copy of the public header (SwiftPM
+      # cannot reach outside the package root). Keep it identical.
+      - name: Swift wrapper header matches helix.h
+        if: runner.os == 'Linux'
+        run: diff -u helix.h wrappers/swift/Sources/CHelix/helix.h
 
       # ============================================================ #
       #  Linux: deep ABI compliance + symbol/node verification       #

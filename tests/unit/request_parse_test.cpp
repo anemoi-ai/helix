@@ -551,3 +551,47 @@ TEST(RequestParse, ToolChoiceInvalidStringRejected) {
         })"),
         Error);
 }
+
+/* ---- Integer range (get<int>() would silently narrow) ---- */
+
+TEST(RequestParse, OutOfRangeIntegerRejected) {
+    try {
+        ChatRequest::from_json(R"({"model":"m","messages":[{"role":"user","content":"x"}],
+            "max_tokens":4294967297})");
+        FAIL() << "expected HELIX_E_VALIDATION";
+    } catch (const Error& e) {
+        EXPECT_EQ(e.status, HELIX_E_VALIDATION);
+        EXPECT_EQ(e.param, "max_tokens");
+    }
+    EXPECT_THROW(ChatRequest::from_json(R"({"model":"m","messages":[{"role":"user","content":"x"}],
+        "n":-9999999999})"), Error);
+}
+
+TEST(RequestParse, IntMaxStillAccepted) {
+    auto r = ChatRequest::from_json(R"({"model":"m","messages":[{"role":"user","content":"x"}],
+        "max_tokens":2147483647})");
+    ASSERT_TRUE(r.max_tokens.has_value());
+    EXPECT_EQ(*r.max_tokens, 2147483647);
+}
+
+/* ---- tool_choice must name a declared tool ---- */
+
+TEST(RequestValidate, ToolChoiceUnknownFunctionRejected) {
+    auto r = ChatRequest::from_json(R"({"model":"m","messages":[{"role":"user","content":"x"}],
+        "tools":[{"type":"function","function":{"name":"f","parameters":{}}}],
+        "tool_choice":{"type":"function","function":{"name":"get_weather"}}})");
+    try {
+        r.validate();
+        FAIL() << "expected HELIX_E_VALIDATION";
+    } catch (const Error& e) {
+        EXPECT_EQ(e.status, HELIX_E_VALIDATION);
+        EXPECT_EQ(e.param, "tool_choice.function.name");
+    }
+}
+
+TEST(RequestValidate, ToolChoiceKnownFunctionAccepted) {
+    auto r = ChatRequest::from_json(R"({"model":"m","messages":[{"role":"user","content":"x"}],
+        "tools":[{"type":"function","function":{"name":"get_weather","parameters":{}}}],
+        "tool_choice":{"type":"function","function":{"name":"get_weather"}}})");
+    EXPECT_NO_THROW(r.validate());
+}
