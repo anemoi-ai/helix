@@ -120,6 +120,9 @@ static GpuLayerPlan fit_pass(const HardwareProfile& hw,
     }
 
     auto mparams = llama_model_default_params();
+    /* llama.cpp's default became LLAMA_LOAD_MODE_AUTO (b12033). Before it
+     * was mmap on, mlock off; keep that, so the fit probe loads as it did. */
+    mparams.load_mode = LLAMA_LOAD_MODE_MMAP;
     auto cparams = llama_context_default_params();
     cparams.n_ctx   = static_cast<uint32_t>(n_ctx > 0 ? n_ctx : 4096);
 
@@ -131,6 +134,7 @@ static GpuLayerPlan fit_pass(const HardwareProfile& hw,
         buft_overrides.data(),
         margins.data(),
         /*n_ctx_min=*/ 512,
+        /*extra=*/ nullptr,   /* no draft model fitted alongside; MTP could pass one later */
         GGML_LOG_LEVEL_WARN);
 
     if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {

@@ -1,5 +1,6 @@
 #include "session.hpp"
 #include "../model/model.hpp"
+#include "../model/load_mode.hpp"
 #include "../model/cuda_lock.hpp"
 #include "../runtime/runtime.hpp"
 #include "../hardware/profile.hpp"
@@ -374,8 +375,8 @@ void Session::init_on_context(const llama_context_params& ctx_params,
             }
             auto dft_params = llama_model_default_params();
             dft_params.n_gpu_layers = model_.n_gpu_layers_actual();
-            dft_params.use_mmap     = model_.options().use_mmap;
-            dft_params.use_mlock    = model_.options().use_mlock;
+            dft_params.load_mode    = load_mode_from(model_.options().use_mmap,
+                                                     model_.options().use_mlock);
             model_.apply_device_preference(dft_params);
             log_info("loading MTP draft model: "
                      + opts_.speculative.draft_model_path);

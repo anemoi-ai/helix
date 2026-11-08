@@ -34,7 +34,8 @@ SamplerPtr build_sampler_chain(const ChatRequest& req,
                                 int reasoning_budget,
                                 const std::string& thinking_start_tag,
                                 const std::string& thinking_end_tag,
-                                bool thinking_forced_open) {
+                                bool thinking_forced_open,
+                                const std::vector<std::string>& thinking_end_tags) {
     const float temperature       = req.temperature.value_or(1.0f);
     const float top_p             = req.top_p.value_or(1.0f);
     const int   top_k             = req.top_k.value_or(40);
@@ -66,6 +67,7 @@ SamplerPtr build_sampler_chain(const ChatRequest& req,
     /* 1. Penalties */
     llama_sampler_chain_add(chain,
         llama_sampler_init_penalties(
+            /*n_vocab=*/ vocab ? llama_vocab_n_tokens(vocab) : 0,
             kDefaultPenaltyWindow,
             repeat_penalty,
             /*penalty_freq=*/    frequency_penalty,
@@ -177,8 +179,21 @@ SamplerPtr build_sampler_chain(const ChatRequest& req,
         const auto initial_state = thinking_forced_open
             ? REASONING_BUDGET_COUNTING
             : REASONING_BUDGET_IDLE;
+        /* The matcher takes lists of start and end sequences (Aho-Corasick,
+         * upstream #25544/#31374); an empty start list is "no start tag". */
+        const std::vector<llama_tokens> start_seqs = start_tokens.empty()
+            ? std::vector<llama_tokens>{}
+            : std::vector<llama_tokens>{start_tokens};
+        /* The forced tag first, then any other tag the template accepts: a
+         * model that closes its thought with an alternative end tag has ended
+         * it, and must not have the budget message forced in afterwards. */
+        std::vector<llama_tokens> end_seqs{end_tokens};
+        for (const auto& tag : thinking_end_tags) {
+            if (tag.empty() || tag == thinking_end_tag) continue;
+            end_seqs.push_back(common_tokenize(vocab, tag, false, true));
+        }
         llama_sampler* rbudget = common_reasoning_budget_init(
-            vocab, start_tokens, end_tokens, forced_tokens, reasoning_budget, initial_state);
+            vocab, start_seqs, end_seqs, forced_tokens, reasoning_budget, initial_state);
         if (rbudget) llama_sampler_chain_add(chain, rbudget);
     }
 

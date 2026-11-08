@@ -73,7 +73,8 @@ llama_pos MmProj::eval_media(
          * Helix passes placeholder=false (it needs real decoded media) and frees
          * any video_ctx — it is only populated for video inputs, which Helix does
          * not expose (and MTMD_VIDEO is built OFF), but handle it defensively. */
-        auto wrapper = mtmd_helper_bitmap_init_from_buf(ctx_, raw.data(), raw.size(), false);
+        auto wrapper = mtmd_helper_bitmap_init_from_buf(ctx_, raw.data(), raw.size(), false,
+                                                        mtmd_helper_init_opt_default());
         if (wrapper.video_ctx) {
             mtmd_helper_video_free(wrapper.video_ctx);
             wrapper.video_ctx = nullptr;

@@ -15,6 +15,7 @@
 #include "../internal/version.hpp"
 #include "../runtime/runtime.hpp"
 #include "decode_loop.hpp"
+#include "llama_batch_util.hpp"
 #include "event_sink.hpp"
 #include "logprobs.hpp"
 #include "utf8.hpp"
@@ -29,6 +30,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <optional>
 #include <random>
@@ -301,26 +303,21 @@ TokenEmitter::TokenEmitter(Session& sess, EventSink& sink, int choice_index,
     , max_new_tokens_(max_new_tokens)
     , stream_coalesce_ms_(stream_coalesce_ms)
     , cancel_flag_(cancel_flag)
-    , has_parser_(rendered.has_tools && !rendered.parser_data.empty())
+    , has_parser_(rendered.has_tools && rendered.parser != nullptr)
     , reasoning_ex_(rendered.extract_reasoning,
                     rendered.thinking_forced_open,
                     resolve_thinking_start_tag(rendered.thinking_start_tag,
                                                rendered.thinking_end_tag),
                     rendered.thinking_end_tag) {
     if (has_parser_) {
-        try {
-            peg_arena_.load(rendered.parser_data);
-            pp_.format            = static_cast<common_chat_format>(rendered.chat_format);
-            pp_.generation_prompt = rendered.generation_prompt;
-            if (rendered.extract_reasoning)
-                pp_.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
-        } catch (const std::exception& e) {
-            /* pp_ is only partially initialized here; clear the flag so no
-             * code path can pair has_parser_==true with an unusable parser. */
-            has_parser_ = false;
-            log_warn("PEG arena load failed, falling back to content-only: " +
-                     std::string(e.what()));
-        }
+        /* A copy, not a reload: the arena is a plain value since llama.cpp
+         * b12033. There is no parse-time reasoning_format any more either:
+         * the reasoning split is decided when the template is applied
+         * (common_chat_templates_inputs::reasoning_format, set in
+         * render_prompt), and the arena built for it does the splitting. */
+        peg_arena_            = *rendered.parser;
+        pp_.format            = static_cast<common_chat_format>(rendered.chat_format);
+        pp_.generation_prompt = common_chat_input(rendered.generation_prompt);
     }
     if (lp_cfg_.enabled) lp_n_vocab_ = llama_vocab_n_tokens(vocab_);
 }
@@ -390,7 +387,8 @@ bool TokenEmitter::emit() {
     if (has_parser_ && !peg_arena_.empty()) {
         try {
             common_chat_msg current = common_chat_peg_parse(
-                peg_arena_, output_.substr(0, emit_len), /*is_partial=*/true, pp_);
+                peg_arena_, common_chat_input(output_.substr(0, emit_len)),
+                /*is_partial=*/true, pp_);
             auto diffs = common_chat_msg_diff::compute_diffs(prev_parsed_, current);
             route_diffs(diffs, sink_, choice_, tool_calls_started_, &reasoning_text_);
             prev_parsed_ = std::move(current);
@@ -409,7 +407,7 @@ DecodeResult TokenEmitter::finish() {
         /* Final parse (non-partial): extracts complete tool calls and remaining content. */
         try {
             common_chat_msg final_msg = common_chat_peg_parse(
-                peg_arena_, output_, /*is_partial=*/false, pp_);
+                peg_arena_, common_chat_input(output_), /*is_partial=*/false, pp_);
             auto diffs = common_chat_msg_diff::compute_diffs(prev_parsed_, final_msg);
             route_diffs(diffs, sink_, choice_, tool_calls_started_, &reasoning_text_);
 
@@ -591,8 +589,8 @@ static DecodeResult decode_one(Session& sess,
         /* Feed token back for next sampling step. */
         llama_batch next_batch;
         if (has_mm) {
-            common_batch_clear(mm_batch);
-            common_batch_add(mm_batch, new_token, mm_n_past++, {0}, true);
+            batch_clear(mm_batch);
+            batch_add(mm_batch, new_token, mm_n_past++, {0}, true);
             next_batch = mm_batch;
         } else {
             next_batch = llama_batch_get_one(&new_token, 1);
@@ -628,45 +626,64 @@ static DecodeResult decode_one_speculative(Session& sess,
                                             const RenderResult& rendered,
                                             const LogprobsConfig& lp_cfg) {
     llama_context* ctx = sess.ctx();
+    llama_context* ctx_mtp = sess.ctx_mtp();
     common_speculative* spec = sess.spec_mtp();
     const int n_prompt = static_cast<int>(prompt_tokens.size());
     const int n_batch  = llama_n_batch(ctx);
+
+    /* The draft context's KV is the caller's to keep in step with the
+     * target's (llama.cpp b12033). Upstream's draft-MTP trims ctx_dft itself
+     * only when it chains several MTP heads; for one head on a separate KV
+     * (e.g. Qwen3.5-family MTP GGUFs) the speculative positions it decodes
+     * stay behind unless the caller removes them, as speculative-simple.cpp
+     * and the server do. Left there, the next catch-up decode and draft seed
+     * collide with them: fatal on M-RoPE models ("inconsistent sequence
+     * positions"), silent draft degradation otherwise. This replaces the
+     * helix-1.4 fork patch 2ee83d0c3, which did the same inside llama.cpp.
+     *
+     * Unguarded for shared-KV drafts (Gemma-4 assistants), as upstream's
+     * callers do it: every trim below starts at or past the target's own
+     * next position, so on a shared cache it removes nothing the target
+     * holds. The return value is ignored, as the fork patch did: a failed
+     * trim can only cost draft quality, since the target verifies every
+     * token. */
+    auto trim_mtp = [ctx_mtp](llama_pos from) {
+        if (ctx_mtp) llama_memory_seq_rm(llama_get_memory(ctx_mtp), 0, from, -1);
+    };
 
     /* ---- Prefill (text-only; the speculative path is never used for
      * multimodal — run_chat_completions falls back to decode_one). ---- */
     {
         llama_memory_t mem = llama_get_memory(ctx);
         llama_memory_seq_rm(mem, 0, 0, -1);
+        trim_mtp(0);
     }
     if (cancel_flag.load(std::memory_order_relaxed))
         return DecodeResult::cancelled_before_output();
 
+    /* Every batch shown to common_speculative_process is a common_batch,
+     * decoded with llama_process: the speculative state reads per-token
+     * entries from the common_batch mirror (llama.cpp b12033), so the batch
+     * it is given must be the very one that was decoded. */
+    common_batch pbatch(ctx);
     for (int i = 0; i < n_prompt; i += n_batch) {
         if (cancel_flag.load(std::memory_order_relaxed))
             return DecodeResult::cancelled_before_output();
         int chunk_size = std::min(n_batch, n_prompt - i);
-        /* Use common_batch_add (sets seq_id) rather than llama_batch_get_one,
-         * because common_speculative_process reads seq_id arrays per token. */
-        llama_batch pbatch = llama_batch_init(chunk_size, 0, 1);
+        pbatch.clear();
         for (int j = 0; j < chunk_size; ++j) {
             /* Only the final prompt token needs logits (for sampling the
-             * first output token). common_batch_add requires explicit logits
-             * flags, unlike llama_batch_get_one which auto-enables the last. */
+             * first output token). */
             bool is_last = (i + j == n_prompt - 1);
-            common_batch_add(pbatch, prompt_tokens[i + j],
-                             static_cast<llama_pos>(i + j), {0}, /*logits=*/is_last);
+            pbatch.add(prompt_tokens[i + j], static_cast<llama_pos>(i + j),
+                       /*seq_id=*/0, /*output=*/is_last);
         }
-        if (llama_decode(ctx, pbatch) != 0) {
-            llama_batch_free(pbatch);
+        if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, pbatch.get()) != 0)
             throw_backend("llama_decode failed during prefill");
-        }
         /* Mirror the prefill chunk into the MTP draft context so its KV
          * state matches the target before drafting begins. */
-        if (!common_speculative_process(spec, pbatch)) {
-            llama_batch_free(pbatch);
+        if (!common_speculative_process(spec, pbatch))
             throw_backend("common_speculative_process failed during prefill");
-        }
-        llama_batch_free(pbatch);
     }
 
     sink.on_role(choice_index);
@@ -687,8 +704,11 @@ static DecodeResult decode_one_speculative(Session& sess,
     if (emitter.push(id_last, lp_raw_first)) return emitter.finish();
 
     /* ---- Speculative decode loop ---- */
-    llama_batch sbatch = llama_batch_init(n_batch, /*embd=*/ 0, /*n_seq_max=*/ 1);
-    struct SBatchGuard { llama_batch b; ~SBatchGuard(){ llama_batch_free(b); } } sguard{sbatch};
+    common_batch sbatch(ctx);
+    /* Draft bookkeeping, logged at the end: helix reports no acceptance rate
+     * through the ABI, and it is the number that says whether MTP is worth
+     * running at all. */
+    size_t n_drafted = 0, n_accepted = 0, n_rounds = 0;
 
     for (;;) {
         if (cancel_flag.load(std::memory_order_relaxed)) {
@@ -698,29 +718,38 @@ static DecodeResult decode_one_speculative(Session& sess,
 
         /* 1. Request a draft. */
         std::vector<llama_token> draft;
-        common_speculative_get_draft_params(spec, /*seq_id=*/0) = {
-            /*drafting=*/true,
-            /*n_max=*/   -1,                 /* impl clamps to remaining ctx */
-            /*n_past=*/  n_past,
-            /*id_last=*/ id_last,
-            /*prompt=*/  &prompt_tokens,
-            /*result=*/  &draft,
-        };
+        {
+            /* Named fields, not a positional initialiser: the struct was
+             * reordered and grew (b12033: n_past -> pos0; result_q, temp,
+             * seed). result_q stays null: greedy drafting, as before. */
+            auto& dp    = common_speculative_get_draft_params(spec, /*seq_id=*/0);
+            dp.drafting = true;
+            dp.n_max    = -1;                /* impl clamps to remaining ctx */
+            dp.pos0     = n_past;
+            dp.id_last  = id_last;
+            dp.prompt   = &prompt_tokens;
+            dp.result   = &draft;
+            dp.result_q = nullptr;
+        }
         common_speculative_draft(spec);
 
+        /* Drafting decoded speculative positions [n_past, ...) into the draft
+         * context; drop them before the catch-up decode below rewrites those
+         * positions from the target's hidden states (see trim_mtp). */
+        trim_mtp(n_past);
+
         /* If no draft (e.g. context exhausted), fall back to a plain
-         * single-token decode to make progress. Build the batch with
-         * common_batch_add — common_speculative_process reads per-token
-         * seq_id arrays, which llama_batch_get_one leaves null. */
+         * single-token decode to make progress. */
         if (draft.empty()) {
-            common_batch_clear(sbatch);
-            common_batch_add(sbatch, id_last, n_past, {0}, /*logits=*/true);
-            if (llama_decode(ctx, sbatch) != 0)
+            sbatch.clear();
+            sbatch.add(id_last, n_past, /*seq_id=*/0, /*output=*/true);
+            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, sbatch.get()) != 0)
                 throw_backend("llama_decode failed during MTP fallback");
             if (!common_speculative_process(spec, sbatch))
                 throw_backend("common_speculative_process failed during MTP fallback");
             llama_token next = llama_sampler_sample(sampler, ctx, -1);
             llama_memory_seq_rm(llama_get_memory(ctx), 0, n_past + 1, -1);
+            trim_mtp(n_past + 1);
             common_speculative_accept(spec, 0, 0);
             if (emitter.push(next, lp_cfg.enabled ? llama_get_logits_ith(ctx, 0) : nullptr))
                 break;
@@ -732,17 +761,15 @@ static DecodeResult decode_one_speculative(Session& sess,
         /* 2. Build target batch: [id_last, draft0, ..., draftN-1]. */
         std::vector<int> spec_i_batch;
         spec_i_batch.reserve(draft.size() + 1);
-        common_batch_clear(sbatch);
-        spec_i_batch.push_back(sbatch.n_tokens);
-        common_batch_add(sbatch, id_last, n_past, {0}, /*logits=*/true);
+        sbatch.clear();
+        spec_i_batch.push_back(sbatch.add(id_last, n_past, /*seq_id=*/0, /*output=*/true));
         for (size_t i = 0; i < draft.size(); ++i) {
-            spec_i_batch.push_back(sbatch.n_tokens);
-            common_batch_add(sbatch, draft[i],
-                             n_past + static_cast<llama_pos>(i) + 1, {0}, /*logits=*/true);
+            spec_i_batch.push_back(sbatch.add(draft[i], n_past + static_cast<llama_pos>(i) + 1,
+                                              /*seq_id=*/0, /*output=*/true));
         }
 
         /* 3. Target decode. */
-        if (llama_decode(ctx, sbatch) != 0)
+        if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, sbatch.get()) != 0)
             throw_backend("llama_decode failed during MTP generation");
 
         /* 4. Mirror target hidden states into the draft context. */
@@ -751,12 +778,16 @@ static DecodeResult decode_one_speculative(Session& sess,
 
         /* 5. Verify draft against the target via the raw sampler chain. */
         auto accepted = helix_sample_and_accept_n(sampler, ctx, spec_i_batch, draft);
+        n_drafted  += draft.size();
+        n_accepted += accepted.size() - 1;
+        ++n_rounds;
 
         /* 6. KV cleanup: remove rejected draft positions. The last accepted
          *    token is only sampled (not decoded) so it stays out of the KV
          *    and becomes id_last for the next iteration. */
         llama_memory_seq_rm(llama_get_memory(ctx), 0,
                             n_past + static_cast<llama_pos>(accepted.size()), -1);
+        trim_mtp(n_past + static_cast<llama_pos>(accepted.size()));
 
         /* 7. Inform the manager how many drafts were accepted. */
         common_speculative_accept(spec, /*seq_id=*/0,
@@ -776,6 +807,14 @@ static DecodeResult decode_one_speculative(Session& sess,
         id_last  = accepted.back();
     }
 
+    if (n_rounds > 0) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+                      "mtp: %zu rounds, %zu drafted, %zu accepted (%.1f%%)",
+                      n_rounds, n_drafted, n_accepted,
+                      n_drafted ? 100.0 * static_cast<double>(n_accepted) / n_drafted : 0.0);
+        log_info(buf);
+    }
     return emitter.finish();
 }
 /* ------------------------------------------------------------------ */
@@ -1058,7 +1097,7 @@ helix_status_t run_chat_completions(Session& sess,
      * an actual guarantee (eager grammar) rather than a hint; for "auto" it
      * is lazy and only engages at the tool-call trigger marker, leaving
      * regular content and <think> output unconstrained. */
-    const bool has_peg = rendered.has_tools && !rendered.parser_data.empty();
+    const bool has_peg = rendered.has_tools && rendered.parser != nullptr;
     const llama_vocab* vocab = llama_model_get_vocab(sess.model().llama_model_ptr());
 
     std::string rf_grammar;
@@ -1171,7 +1210,8 @@ helix_status_t run_chat_completions(Session& sess,
                                                   req.reasoning_budget.value_or(-1),
                                                   rendered.thinking_start_tag,
                                                   rendered.thinking_end_tag,
-                                                  rendered.thinking_forced_open);
+                                                  rendered.thinking_forced_open,
+                                                  rendered.thinking_end_tags);
 
         /* Pass mm_n_past_start so decode_one uses explicit positions for each
          * generated token; otherwise ISWA's seq_pos_max() mis-reports after

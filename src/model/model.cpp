@@ -1,4 +1,5 @@
 #include "model.hpp"
+#include "load_mode.hpp"
 #include "../runtime/runtime.hpp"
 #include "../hardware/gpu_layer_select.hpp"
 #include "../multimodal/mmproj.hpp"
@@ -284,8 +285,7 @@ Model::Model(Runtime& rt, const ModelOptions& opts,
     // ------------------------------------------------------------------
     auto params         = llama_model_default_params();
     params.n_gpu_layers = n_gpu_layers_actual_;
-    params.use_mmap     = opts.use_mmap;
-    params.use_mlock    = opts.use_mlock;
+    params.load_mode    = load_mode_from(opts.use_mmap, opts.use_mlock);
     params.vocab_only   = opts.vocab_only;
     apply_device_preference(params);
 

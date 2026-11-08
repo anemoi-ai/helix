@@ -1,8 +1,7 @@
 #include "response_format.hpp"
 #include "../internal/error.hpp"
 
-#include "nlohmann/json.hpp"
-#include "json-schema-to-grammar.h"
+#include "json-schema-to-grammar.h"  /* brings common_json (common/json.h) */
 
 namespace helix {
 
@@ -61,9 +60,13 @@ ResponseFormatResolved resolve_response_format(
                 "response_format");
         }
 
-        nlohmann::ordered_json js_obj;
+        /* common_json, not nlohmann: json_schema_to_grammar takes it since
+         * upstream b12033. It keeps insertion order, as ordered_json did, so
+         * properties still reach the grammar in the order the client wrote
+         * them; its parse errors are std::runtime_error, so the catch holds. */
+        common_json js_obj;
         try {
-            js_obj = nlohmann::ordered_json::parse(json_schema_str);
+            js_obj = common_json::parse(json_schema_str);
         } catch (const std::exception& e) {
             throw_validation(
                 std::string("response_format.json_schema is not valid JSON: ") + e.what(),
@@ -72,9 +75,9 @@ ResponseFormatResolved resolve_response_format(
 
         // The json_schema object contains {name?, description?, schema, strict?}.
         // Extract the actual schema. Accept direct schema objects too (some clients omit nesting).
-        nlohmann::ordered_json schema;
-        if (js_obj.contains("schema") && js_obj["schema"].is_object()) {
-            schema = js_obj["schema"];
+        common_json schema;
+        if (js_obj.contains("schema") && js_obj.at("schema").is_object()) {
+            schema = js_obj.at("schema");
         } else if (js_obj.contains("type") || js_obj.contains("properties") ||
                    js_obj.contains("anyOf") || js_obj.contains("oneOf")) {
             schema = js_obj;
