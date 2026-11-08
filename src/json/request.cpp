@@ -2,11 +2,29 @@
 #include "../internal/error.hpp"
 #include "../multimodal/image_decode.hpp"
 #include "../util/strings.hpp"
+#include "../util/json_parse.hpp"
 #include "nlohmann/json.hpp"
+
+#include <algorithm>
+#include <limits>
 
 using json = nlohmann::json;
 
 namespace helix {
+
+static json parse_request_object(const std::string& json_str) {
+    return parse_json_object<json>(json_str, "request body", /*null_is_empty=*/false);
+}
+
+/* A required string member: missing/null and mistyped are distinct errors. */
+static std::string require_string(const json& j, const char* key) {
+    auto it = j.find(key);
+    if (it == j.end() || it->is_null())
+        throw_validation(std::string("missing required field '") + key + "'", key);
+    if (!it->is_string())
+        throw_validation(std::string("'") + key + "' must be a string", key);
+    return it->get<std::string>();
+}
 
 static std::string get_str(const json& j, const char* key, const std::string& def = "") {
     auto it = j.find(key);
@@ -52,7 +70,7 @@ static ContentPart parse_content_part(const json& j, size_t part_idx) {
         if (starts_with(url, "data:image/")) {
             p.media_raw = decode_image_data_uri(url);
         } else if (starts_with(url, "file://")) {
-            p.media_raw = load_file_uri(url);
+            p.media_file_uri = url;
         } else {
             throw_validation(
                 "image_url.url must be a data URI (data:image/...) or a "
@@ -211,23 +229,12 @@ static Tool parse_tool(const json& j) {
 }
 
 ChatRequest ChatRequest::from_json(const std::string& json_str) {
-    json j;
-    try {
-        j = json::parse(json_str);
-    } catch (const json::parse_error& e) {
-        throw_invalid_json(std::string("JSON parse error: ") + e.what());
-    }
-
-    if (!j.is_object()) throw_invalid_json("request body must be a JSON object");
+    json j = parse_request_object(json_str);
 
     ChatRequest r;
 
     /* Required */
-    if (!j.contains("model") || j["model"].is_null())
-        throw_validation("missing required field 'model'", "model");
-    if (!j["model"].is_string())
-        throw_validation("'model' must be a string", "model");
-    r.model = j["model"].get<std::string>();
+    r.model = require_string(j, "model");
 
     if (!j.contains("messages") || !j["messages"].is_array())
         throw_validation("missing required field 'messages'", "messages");
@@ -246,6 +253,13 @@ ChatRequest ChatRequest::from_json(const std::string& json_str) {
         auto it = j.find(key);
         if (it == j.end() || it->is_null()) return std::nullopt;
         if (!it->is_number_integer()) throw_validation(std::string("'") + key + "' must be an integer", key);
+        /* get<int>() narrows silently (4294967297 -> 1), which would let an
+         * out-of-range value slip past validate() as a different number. */
+        const bool fits = it->is_number_unsigned()
+            ? it->get<uint64_t>() <= static_cast<uint64_t>(std::numeric_limits<int>::max())
+            : (it->get<int64_t>() >= std::numeric_limits<int>::min() &&
+               it->get<int64_t>() <= std::numeric_limits<int>::max());
+        if (!fits) throw_validation(std::string("'") + key + "' is out of range", key);
         return it->get<int>();
     };
 
@@ -448,8 +462,18 @@ void ChatRequest::validate() const {
     /* A tool_choice that pins a function must name one; an empty name would
      * otherwise fall through to "match any tool" semantics. */
     if (tool_choice && std::holds_alternative<ToolChoiceFunction>(*tool_choice)) {
-        if (std::get<ToolChoiceFunction>(*tool_choice).name.empty()) {
+        const std::string& name = std::get<ToolChoiceFunction>(*tool_choice).name;
+        if (name.empty()) {
             throw_validation("tool_choice.function.name cannot be empty",
+                             "tool_choice.function.name");
+        }
+        /* OpenAI rejects a pinned function that is not in tools[]; without
+         * this the render step would fall back to "any tool, required". */
+        const bool known = std::any_of(tools.begin(), tools.end(),
+            [&name](const Tool& t) { return t.function.name == name; });
+        if (!known) {
+            throw_validation("tool_choice references function '" + name +
+                             "', which is not in tools",
                              "tool_choice.function.name");
         }
     }
@@ -519,22 +543,11 @@ void ChatRequest::validate() const {
 static constexpr size_t k_max_embedding_inputs = 2048;
 
 EmbeddingsRequest EmbeddingsRequest::from_json(const std::string& json_str) {
-    json j;
-    try {
-        j = json::parse(json_str);
-    } catch (const json::parse_error& e) {
-        throw_invalid_json(std::string("JSON parse error: ") + e.what());
-    }
-
-    if (!j.is_object()) throw_invalid_json("request body must be a JSON object");
+    json j = parse_request_object(json_str);
 
     EmbeddingsRequest r;
 
-    if (!j.contains("model") || j["model"].is_null())
-        throw_validation("missing required field 'model'", "model");
-    if (!j["model"].is_string())
-        throw_validation("'model' must be a string", "model");
-    r.model = j["model"].get<std::string>();
+    r.model = require_string(j, "model");
 
     if (!j.contains("input") || j["input"].is_null())
         throw_validation("missing required field 'input'", "input");
@@ -551,11 +564,9 @@ EmbeddingsRequest EmbeddingsRequest::from_json(const std::string& json_str) {
                              "input");
         for (const auto& item : in) {
             if (item.is_number_integer() || item.is_array()) {
-                throw Error(HELIX_E_UNSUPPORTED_FEATURE,
-                            "pre-tokenized 'input' (integer token arrays) is "
-                            "not supported; pass text strings",
-                            "unsupported_feature_error", "input",
-                            "helix_e_unsupported_feature");
+                throw_unsupported("pre-tokenized 'input' (integer token arrays) is "
+                                  "not supported; pass text strings",
+                                  "input");
             }
             if (!item.is_string())
                 throw_validation("'input' array elements must be strings", "input");
@@ -581,11 +592,9 @@ EmbeddingsRequest EmbeddingsRequest::from_json(const std::string& json_str) {
     }
 
     if (j.contains("dimensions") && !j["dimensions"].is_null()) {
-        throw Error(HELIX_E_UNSUPPORTED_FEATURE,
-                    "'dimensions' is not supported; vectors always have the "
-                    "model's full output dimension (see helix_model_embedding_dim)",
-                    "unsupported_feature_error", "dimensions",
-                    "helix_e_unsupported_feature");
+        throw_unsupported("'dimensions' is not supported; vectors always have the "
+                          "model's full output dimension (see helix_model_embedding_dim)",
+                          "dimensions");
     }
 
     /* Unknown fields are ignored, matching ChatRequest leniency. */
@@ -607,28 +616,13 @@ void EmbeddingsRequest::validate() const {
 static constexpr size_t k_max_rerank_documents = 1024;
 
 RerankRequest RerankRequest::from_json(const std::string& json_str) {
-    json j;
-    try {
-        j = json::parse(json_str);
-    } catch (const json::parse_error& e) {
-        throw_invalid_json(std::string("JSON parse error: ") + e.what());
-    }
-
-    if (!j.is_object()) throw_invalid_json("request body must be a JSON object");
+    json j = parse_request_object(json_str);
 
     RerankRequest r;
 
-    if (!j.contains("model") || j["model"].is_null())
-        throw_validation("missing required field 'model'", "model");
-    if (!j["model"].is_string())
-        throw_validation("'model' must be a string", "model");
-    r.model = j["model"].get<std::string>();
+    r.model = require_string(j, "model");
 
-    if (!j.contains("query") || j["query"].is_null())
-        throw_validation("missing required field 'query'", "query");
-    if (!j["query"].is_string())
-        throw_validation("'query' must be a string", "query");
-    r.query = j["query"].get<std::string>();
+    r.query = require_string(j, "query");
 
     if (!j.contains("documents") || j["documents"].is_null())
         throw_validation("missing required field 'documents'", "documents");

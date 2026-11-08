@@ -5,9 +5,12 @@
 #include <string>
 #include <vector>
 #include "helix.h"
+#include "../model/cuda_lock.hpp"
 
 struct llama_context;
+struct llama_context_params;
 struct llama_model;
+struct llama_adapter_lora;
 struct common_speculative;
 typedef int32_t llama_token;
 
@@ -133,10 +136,14 @@ public:
     helix_status_t count_tokens(const char* request_json,
                                 uint32_t* out_token_count);
 
+    /* Cancels the in-flight request, if any; a no-op while idle. */
     void cancel();
 
     llama_context* ctx()        const { return ctx_; }
     const Model&         model()      const { return model_; }
+    /* Throws HELIX_E_MODEL_NOT_FOUND (param "model") unless `requested`
+     * names this session's model. */
+    void require_model_alias(const std::string& requested) const;
     std::atomic<bool>& cancel_flag()        { return cancel_requested_; }
 
     bool embedding_mode()    const { return opts_.embedding; }
@@ -182,8 +189,34 @@ private:
     SessionOptions opts_;
     llama_context* ctx_ = nullptr;
     std::mutex     mu_;
+    /* cancel_mu_ orders cancel() against request entry/exit so a cancel only
+     * lands on a request that is in flight, never on the next one. */
+    std::mutex     cancel_mu_;
+    bool           in_flight_ = false;
     std::atomic<bool> cancel_requested_{false};
     std::atomic<bool> warmup_done_{false};
+
+    /* Marks a request in flight for its lifetime (taken after mu_). */
+    struct InFlight {
+        explicit InFlight(Session& s);
+        ~InFlight();
+        Session& sess;
+    };
+
+    /* Held for the whole of every API call that touches the context. Encodes
+     * the lock order once: the model-wide GPU lock (CUDA/ROCm builds) before
+     * mu_, then the in-flight marker that makes the call cancellable.
+     * save/restore are not cancellable and pass cancellable=false. */
+    class CallGuard {
+    public:
+        CallGuard(Session& s, bool cancellable);
+    private:
+#if HELIX_CUDA_REQUIRES_GLOBAL_LOCK
+        std::lock_guard<std::mutex> gpu_;
+#endif
+        std::lock_guard<std::mutex> session_;
+        std::optional<InFlight>     in_flight_;
+    };
 
     int  effective_pooling_ = -1;
     bool embed_via_encode_  = false;
@@ -206,6 +239,13 @@ private:
     common_speculative*  spec_mtp_  = nullptr;
 
     void maybe_run_warmup();
+
+    /* Constructor steps that run once ctx_ exists. Any throw from here is
+     * cleaned up by release_all(). */
+    void init_on_context(const llama_context_params& ctx_params,
+                         std::vector<llama_adapter_lora*>& lora_ptrs);
+    /* Frees the MTP state and ctx_ in dependency order; idempotent. */
+    void release_all() noexcept;
 
     /* Throws HELIX_E_UNSUPPORTED_FEATURE unless this session's state can be
      * persisted (chat session, no MTP, prefix cache on). `what` names the

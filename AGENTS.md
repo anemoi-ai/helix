@@ -23,7 +23,7 @@ protocol byte-identical to OpenAI. No subprocesses, no sockets, no Python.
 ## Repository layout (the parts that matter most)
 
 ```
-helix.h                       Public C ABI (26 symbols). Touching it = ABI bump.
+helix.h                       Public C ABI (29 symbols). Touching it = ABI bump.
 helix.ld / helix.exp / helix.def   Linux / macOS / Windows export control.
 CMakeLists.txt                Build; backend selection; per-platform export wiring.
 tests/CMakeLists.txt          Unit-test source list (mirrors the CPU-probe conditional).

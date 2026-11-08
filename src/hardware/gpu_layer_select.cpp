@@ -1,5 +1,6 @@
 #include "gpu_layer_select.hpp"
 #include "../internal/log.hpp"
+#include "../util/fs_path.hpp"
 
 #include "llama.h"
 #include "common.h"
@@ -57,7 +58,7 @@ static GpuLayerPlan heuristic_fit(const HardwareProfile& hw,
     uint64_t per_layer = kDefaultLayerSizeBytes;
     if (n_layers > 0 && !model_path.empty()) {
         std::error_code ec;
-        const auto fsize = std::filesystem::file_size(model_path, ec);
+        const auto fsize = std::filesystem::file_size(utf8_path(model_path), ec);
         if (!ec && fsize > 0) {
             per_layer = static_cast<uint64_t>(fsize) / static_cast<uint64_t>(n_layers);
             if (per_layer == 0) per_layer = kDefaultLayerSizeBytes;
@@ -190,7 +191,9 @@ GpuLayerPlan pick_n_gpu_layers(const HardwareProfile& hw,
 
     // kGpuLayersAll: request full offload, run fit to validate.
     if (user_request == kGpuLayersAll) {
-        GpuLayerPlan plan = fit_pass(hw, model_path, n_layers, n_ctx);
+        GpuLayerPlan plan = model_path.empty()
+            ? heuristic_fit(hw, model_path, n_layers, n_ctx)
+            : fit_pass(hw, model_path, n_layers, n_ctx);
         if (!plan.full_offload) {
             log_warn("n_gpu_layers=all requested but only " +
                      std::to_string(plan.n_gpu_layers) + "/" +

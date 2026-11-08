@@ -2,7 +2,7 @@
 
 #ifdef _WIN32
 
-#include <windows.h>
+#include "../util/win_utf8.hpp"
 #include <intrin.h>
 
 #include <algorithm>
@@ -32,18 +32,16 @@ static std::string get_model_name_from_registry() {
         return {};
     }
     WCHAR buf[256] = {};
-    DWORD len = sizeof(buf);
+    /* Leave room for a terminator: REG_SZ data is not guaranteed to be
+     * NUL-terminated, and the conversion below reads up to the first NUL. */
+    DWORD len = sizeof(buf) - sizeof(WCHAR);
     DWORD type = 0;
     LSTATUS rc = RegQueryValueExW(hKey, L"ProcessorNameString",
                                   nullptr, &type,
                                   reinterpret_cast<LPBYTE>(buf), &len);
     RegCloseKey(hKey);
     if (rc != ERROR_SUCCESS || type != REG_SZ) return {};
-    int n = WideCharToMultiByte(CP_UTF8, 0, buf, -1, nullptr, 0, nullptr, nullptr);
-    std::string result(n > 0 ? n - 1 : 0, '\0');
-    if (n > 0)
-        WideCharToMultiByte(CP_UTF8, 0, buf, -1, result.data(), n, nullptr, nullptr);
-    return result;
+    return narrow_utf8(buf);
 }
 
 struct CoreTopology {

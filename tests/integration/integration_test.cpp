@@ -10,6 +10,7 @@
 #include "helix.h"
 #include "nlohmann/json.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -76,6 +77,28 @@ protected:
         if (sess)  { helix_session_destroy(sess);  sess  = nullptr; }
         if (model) { helix_model_release(model);   model = nullptr; }
         if (rt)    { helix_runtime_destroy(rt);    rt    = nullptr; }
+    }
+
+    /* Rebuild runtime, model and session with the given runtime options. */
+    void reload_with_runtime_options(const char* runtime_opts) {
+        TearDown();
+        ASSERT_EQ(helix_runtime_create(runtime_opts, &rt), HELIX_OK)
+            << helix_last_error_json();
+        char opts[1024];
+        snprintf(opts, sizeof(opts),
+                 "{\"model_path\":\"%s\",\"alias\":\"%s\"}",
+                 json_path(model_path_env()).c_str(), model_alias());
+        ASSERT_EQ(helix_model_load(rt, opts, &model), HELIX_OK)
+            << helix_last_error_json();
+        ASSERT_EQ(helix_session_create(model, R"({"n_ctx":2048})", &sess), HELIX_OK)
+            << helix_last_error_json();
+    }
+
+    void fresh_session() {
+        helix_session_destroy(sess);
+        sess = nullptr;
+        ASSERT_EQ(helix_session_create(model, R"({"n_ctx":2048})", &sess), HELIX_OK)
+            << helix_last_error_json();
     }
 
     /* Helper: run a request and return parsed JSON. */
@@ -205,6 +228,78 @@ TEST_F(HelixFixture, SeedDeterminism) {
     std::string c1 = j1["choices"][0]["message"]["content"];
     std::string c2 = j2["choices"][0]["message"]["content"];
     EXPECT_EQ(c1, c2) << "same seed should produce identical output";
+}
+
+/* ---- Test 6b: runtime "deterministic" — an omitted seed acts as seed 0 ---- */
+TEST_F(HelixFixture, DeterministicRuntimeDefaultsSeedToZero) {
+    ASSERT_NO_FATAL_FAILURE(reload_with_runtime_options(R"({"deterministic":true})"));
+
+    const std::string prompt = "Write a short poem about the sea.";
+    auto unseeded_a = run(req(prompt, 24, 1.0f));
+    ASSERT_NO_FATAL_FAILURE(fresh_session());
+    auto unseeded_b = run(req(prompt, 24, 1.0f));
+    ASSERT_NO_FATAL_FAILURE(fresh_session());
+    auto seed_zero  = run(req(prompt, 24, 1.0f, 1, "\"seed\":0"));
+
+    const std::string a = unseeded_a["choices"][0]["message"]["content"];
+    const std::string b = unseeded_b["choices"][0]["message"]["content"];
+    const std::string z = seed_zero["choices"][0]["message"]["content"];
+    EXPECT_EQ(a, b) << "deterministic runtime should make unseeded requests repeatable";
+    EXPECT_EQ(a, z) << "deterministic runtime should sample unseeded requests as seed 0";
+}
+
+/* ---- Test 6c: runtime device_preference "cpu" keeps the model off the GPU ---- */
+TEST_F(HelixFixture, DevicePreferenceCpuOffloadsNothing) {
+    ASSERT_NO_FATAL_FAILURE(reload_with_runtime_options(R"({"device_preference":"cpu"})"));
+
+    auto rt_desc = json::parse(helix_runtime_describe(rt));
+    EXPECT_EQ(rt_desc["device_preference"], "cpu");
+    auto model_desc = json::parse(helix_model_describe(model));
+    EXPECT_EQ(model_desc["n_gpu_layers_actual"], 0);
+
+    auto j = run(req("Say hi.", 4, 0.0f));
+    EXPECT_FALSE(j["choices"].empty());
+}
+
+/* ---- Test 6d: an unsupported device_preference falls back to "auto" ---- */
+TEST_F(HelixFixture, DevicePreferenceUnknownFallsBackToAuto) {
+    helix_runtime_t* other = nullptr;
+    ASSERT_EQ(helix_runtime_create(R"({"device_preference":"cuda:7"})", &other),
+              HELIX_OK) << helix_last_error_json();
+    auto desc = json::parse(helix_runtime_describe(other));
+    EXPECT_EQ(desc["device_preference"], "auto");
+    helix_runtime_destroy(other);
+}
+
+/* ---- Test 6e: embedding session with a batch smaller than the default
+ * sequence capacity (used to abort the process inside llama.cpp) ---- */
+TEST_F(HelixFixture, EmbeddingSmallBatchSessionAndOversizeInput) {
+    helix_session_t* emb = nullptr;
+    ASSERT_EQ(helix_session_create(model,
+                  R"({"embedding":true,"pooling":"mean","n_batch":8})", &emb),
+              HELIX_OK) << helix_last_error_json();
+
+    const std::string ok_req = std::string("{\"model\":\"") + model_alias() +
+                               "\",\"input\":[\"a\",\"b\",\"c\"]}";
+    char* out = nullptr;
+    ASSERT_EQ(helix_embeddings(emb, ok_req.c_str(), &out), HELIX_OK)
+        << helix_last_error_json();
+    EXPECT_EQ(json::parse(out)["data"].size(), 3u);
+    helix_free(out);
+
+    const std::string long_req = std::string("{\"model\":\"") + model_alias() +
+        "\",\"input\":[\"one two three four five six seven eight nine ten\"]}";
+    out = nullptr;
+    EXPECT_EQ(helix_embeddings(emb, long_req.c_str(), &out), HELIX_E_CONTEXT_FULL);
+    EXPECT_EQ(out, nullptr);
+    auto err = json::parse(helix_last_error_json())["error"];
+    EXPECT_EQ(err["param"], "input");
+    EXPECT_EQ(err["limit"], 8);
+    EXPECT_GT(err["requested"].get<int>(), 8);
+    EXPECT_NE(err["message"].get<std::string>().find("Shorten the input"),
+              std::string::npos) << err.dump();
+
+    helix_session_destroy(emb);
 }
 
 /* ---- Test 7: context full ---- */
@@ -698,20 +793,43 @@ TEST_F(HelixStreamFixture, StreamCancelMidStream) {
     }
 }
 
-/* ---- Test 19: Cancel before first token ---- */
+/* ---- Test 19: Cancel before first token (from the role chunk) ---- */
 TEST_F(HelixStreamFixture, StreamCancelBeforeFirstToken) {
-    helix_session_cancel(sess);  /* cancel before calling stream */
+    struct CancelOnFirstChunk {
+        StreamCollector  sc;
+        helix_session_t* sess = nullptr;
 
-    StreamCollector sc;
+        static int callback(void* ud, const char* chunk_json) {
+            auto* s = reinterpret_cast<CancelOnFirstChunk*>(ud);
+            if (s->sc.chunks.empty() && chunk_json) {
+                helix_session_cancel(s->sess);
+            }
+            return StreamCollector::callback(&s->sc, chunk_json);
+        }
+    };
+
+    CancelOnFirstChunk c;
+    c.sess = sess;
     helix_status_t st = helix_chat_completions_stream(
         sess, stream_req("Say something long.", 256, 0.0f).c_str(),
-        StreamCollector::callback, &sc);
+        CancelOnFirstChunk::callback, &c);
 
     EXPECT_EQ(st, HELIX_OK);
+    EXPECT_TRUE(c.sc.null_received);
+    /* The role chunk precedes the first token; no content may follow it. */
+    EXPECT_TRUE(c.sc.content().empty())
+        << "Content unexpectedly produced after cancel: " << c.sc.content();
+}
+
+/* ---- Test 19b: Cancel while idle does not leak into the next request ---- */
+TEST_F(HelixStreamFixture, CancelWhileIdleIsNoOp) {
+    helix_session_cancel(sess);  /* nothing in flight */
+
+    auto sc = run_stream(stream_req("Count from 1 to 10.", 8, 0.0f));
     EXPECT_TRUE(sc.null_received);
-    /* No content should have been produced. */
-    EXPECT_TRUE(sc.content().empty())
-        << "Content unexpectedly produced after pre-cancel: " << sc.content();
+    EXPECT_FALSE(sc.content().empty())
+        << "an idle cancel must not cancel the following request";
+    EXPECT_EQ(sc.finish_reason(), "length");
 }
 
 /* ---- Test 20: n=2 streaming — indices correct ---- */
@@ -838,66 +956,53 @@ TEST_F(HelixStreamFixture, PrefixCacheCorrectness) {
 
 /* ---- Test 23: Prefix-cache speedup ---- */
 TEST_F(HelixFixture, PrefixCacheSpeedup) {
+    /* Models whose memory cannot be partially rolled back (hybrid
+     * recurrent/attention, e.g. Qwen3-Next) re-prefill every request, so
+     * there is no speedup to observe. */
+    if (const char* v = std::getenv("HELIX_TEST_NO_PARTIAL_ROLLBACK");
+        v && v[0] == '1') {
+        GTEST_SKIP() << "HELIX_TEST_NO_PARTIAL_ROLLBACK=1";
+    }
+
     /* Build a fat prompt so prefill dominates response time. */
-    std::string filler = make_filler(300);  /* ~300-token filler */
+    const std::string filler = make_filler(300);  /* ~300-token filler */
+    const std::string suffix = " also briefly mention the word orange";
 
-    /* Escape filler for JSON embedding (it's ASCII so no escaping needed). */
-    char turn1[16384];
-    snprintf(turn1, sizeof(turn1),
-             "{\"model\":\"%s\","
-             "\"messages\":[{\"role\":\"user\",\"content\":\"%s say one word\"}],"
-             "\"max_tokens\":1,\"temperature\":0}",
-             model_alias(), filler.c_str());
-
-    /* Turn 1 warm-up (first call may have extra overhead). */
-    {
+    auto timed_us = [&](const std::string& body) {
+        const auto t0 = std::chrono::steady_clock::now();
         char* out = nullptr;
-        helix_chat_completions(sess, turn1, &out);
+        EXPECT_EQ(helix_chat_completions(sess, body.c_str(), &out), HELIX_OK)
+            << helix_last_error_json();
         if (out) helix_free(out);
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now() - t0).count();
+    };
+
+    /* Absorb first-call overhead (warmup, allocator growth). */
+    timed_us(req("Say hi.", 1, 0.0f));
+
+    /* Cold: a prompt whose content diverges from everything cached at its
+     * first token, so the whole filler is prefilled. Cached: the same prompt
+     * extended by a suffix, so only the suffix is prefilled. Best of two
+     * rounds, each with a fresh prefix, to damp scheduler noise. */
+    long long best_cold   = std::numeric_limits<long long>::max();
+    long long best_cached = std::numeric_limits<long long>::max();
+    for (int round = 0; round < 2; ++round) {
+        const std::string base = "Variant " + std::to_string(round) + ". " +
+                                 filler + " say one word";
+        best_cold   = std::min<long long>(best_cold,
+                                          timed_us(req(base, 1, 0.0f)));
+        best_cached = std::min<long long>(best_cached,
+                                          timed_us(req(base + suffix, 1, 0.0f)));
     }
 
-    /* Turn 1 timed: same prompt (now prefix-cached). */
-    auto t_warm_start = std::chrono::steady_clock::now();
-    {
-        char* out = nullptr;
-        helix_chat_completions(sess, turn1, &out);
-        if (out) helix_free(out);
-    }
-    auto t_warm = std::chrono::steady_clock::now() - t_warm_start;
+    fprintf(stderr, "[PrefixCacheSpeedup] cold=%lldus  cached_suffix=%lldus\n",
+            best_cold, best_cached);
 
-    /* Turn 2: extend the prompt by 50 tokens — only the suffix is decoded. */
-    std::string suffix = " also briefly mention the word orange";
-    char turn2[16384];
-    snprintf(turn2, sizeof(turn2),
-             "{\"model\":\"%s\","
-             "\"messages\":[{\"role\":\"user\",\"content\":\"%s%s\"}],"
-             "\"max_tokens\":1,\"temperature\":0}",
-             model_alias(), filler.c_str(), suffix.c_str());
-
-    auto t_cache_start = std::chrono::steady_clock::now();
-    {
-        char* out = nullptr;
-        helix_chat_completions(sess, turn2, &out);
-        if (out) helix_free(out);
-    }
-    auto t_cache = std::chrono::steady_clock::now() - t_cache_start;
-
-    auto warm_ms  = std::chrono::duration_cast<std::chrono::milliseconds>(t_warm).count();
-    auto cache_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_cache).count();
-
-    fprintf(stderr,
-            "[PrefixCacheSpeedup] warm=%ldms  cache_suffix=%ldms\n",
-            (long)warm_ms, (long)cache_ms);
-
-    /* With prefix cache, turn 2 only decodes ~50 new tokens vs ~300 for turn 1.
-     * Skip if no speedup was observed — this happens on hybrid recurrent/attention
-     * models (e.g. Qwen3) whose KV memory does not support partial rollback. */
-    if (warm_ms > 0 && cache_ms >= warm_ms) {
-        GTEST_SKIP() << "Prefix cache speedup not observed (model may not support "
-                        "partial KV rollback); correctness is tested separately";
-    }
-    EXPECT_LT(cache_ms, warm_ms)
-        << "Turn 2 with prefix cache should be faster than a full prefill";
+    EXPECT_LT(best_cached, best_cold)
+        << "extending a cached prompt should be faster than a full prefill "
+           "(set HELIX_TEST_NO_PARTIAL_ROLLBACK=1 for models without partial "
+           "KV rollback)";
 }
 
 /* ---- Test 24: Prefix-cache divergence (system prompt change) ---- */
@@ -1038,6 +1143,10 @@ TEST_F(HelixFixture, LogprobsReproducible) {
     snprintf(buf, sizeof(buf), rq, model_alias());
 
     auto j1 = run(buf);
+    /* Fresh session for the repeat: a prefix-cache hit re-decodes only the
+     * final prompt token, and GPU backends pick a different kernel for a
+     * one-token batch, which shifts logprobs by ~1e-2 (see SeedDeterminism). */
+    ASSERT_NO_FATAL_FAILURE(fresh_session());
     auto j2 = run(buf);
 
     ASSERT_FALSE(j1["choices"].empty());

@@ -11,6 +11,7 @@
 
 namespace helix {
 
+#if defined(__linux__)
 // ---------------------------------------------------------------------------
 // PCIe link speed/width from Linux sysfs.
 // The PCI address is formatted as "%04x:%02x:%02x.0" (domain:bus:device.fn).
@@ -61,6 +62,7 @@ static void read_pcie_info_linux(int pci_domain, int pci_bus, int pci_device,
         }
     }
 }
+#endif // __linux__
 
 // ---------------------------------------------------------------------------
 // Public entry point called from accelerators.cpp for each CUDA device.

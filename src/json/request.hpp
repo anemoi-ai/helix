@@ -23,8 +23,13 @@ struct ContentPart {
     /* raw media bytes:
      *   image_url:   decoded PNG/JPEG/WebP bytes (from data URI or file URI)
      *   input_audio: decoded WAV/MP3 bytes (from base64 audio.data field)
-     * Empty for text parts. */
+     * Empty for text parts, and for file URIs until they are loaded. */
     std::vector<uint8_t> media_raw;
+    /* image_url given as a file:// URI. Read (into media_raw) only once the
+     * session is known to accept media, never during request parsing. */
+    std::string media_file_uri;
+
+    bool is_media() const { return type == "image_url" || type == "input_audio"; }
 };
 
 struct ToolCall {

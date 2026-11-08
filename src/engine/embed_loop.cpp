@@ -4,8 +4,10 @@
 #include "../model/model.hpp"
 #include "../json/request.hpp"
 #include "../json/response.hpp"
+#include "../internal/caller_alloc.hpp"
 #include "../internal/error.hpp"
 #include "../internal/log.hpp"
+#include "../util/json_dump.hpp"
 
 #include "llama.h"
 #include "common.h"
@@ -47,6 +49,32 @@ void warn_if_missing_eos_sep(const llama_vocab* vocab,
     }
 }
 
+/* Fill a "rerank" chat template's {query}/{document} placeholders in one
+ * left-to-right pass. Sequential replace-all would re-substitute inside the
+ * inserted text (a query containing "{document}" would receive the
+ * document). */
+std::string format_rerank_prompt(const std::string& tmpl,
+                                 const std::string& query,
+                                 const std::string& document) {
+    static const std::string kQuery    = "{query}";
+    static const std::string kDocument = "{document}";
+    std::string out;
+    out.reserve(tmpl.size() + query.size() + document.size());
+    size_t i = 0;
+    while (i < tmpl.size()) {
+        if (tmpl.compare(i, kQuery.size(), kQuery) == 0) {
+            out += query;
+            i += kQuery.size();
+        } else if (tmpl.compare(i, kDocument.size(), kDocument) == 0) {
+            out += document;
+            i += kDocument.size();
+        } else {
+            out += tmpl[i++];
+        }
+    }
+    return out;
+}
+
 int32_t run_one_batch(Session& sess, llama_batch& batch) {
     llama_context* ctx = sess.ctx();
     /* Clear all KV before each flush; for the encoder path this is a
@@ -56,71 +84,39 @@ int32_t run_one_batch(Session& sess, llama_batch& batch) {
                                    : llama_decode(ctx, batch);
 }
 
-} // namespace
+/* No silent truncation — mirrors the llama.cpp server guard. `item` names the
+ * sequence in the message ("input[3]"), `shorten` what the caller should
+ * shorten, `param` the request field. */
+void require_fits_batch(const std::vector<llama_token>& t, uint32_t n_batch,
+                        const std::string& item, const char* shorten,
+                        const char* param) {
+    if (t.size() <= n_batch) return;
+    throw_context_full(static_cast<int64_t>(t.size()),
+                       static_cast<int64_t>(n_batch),
+                       item + " is " + std::to_string(t.size()) + " tokens; the "
+                       "session batch size is " + std::to_string(n_batch) +
+                       ". Shorten the " + shorten + " or raise n_batch/n_ctx in "
+                       "session options",
+                       param);
+}
 
-helix_status_t run_embeddings(Session& sess,
-                              const char* request_json,
-                              char** out_response_json) {
-    /* 1. Parse and validate. Mode and alias gating mirror the chat path:
-     * the embedding-mode check lives in Session::embeddings. */
-    EmbeddingsRequest req =
-        EmbeddingsRequest::from_json(request_json ? request_json : "");
-    req.validate();
+/* Packs `toks` into flushes, runs each one and hands every sequence's pooled
+ * output to on_seq(item_index, pooled). The planner is the
+ * determinism-critical seam (insertion-ordered; see embed_packing.hpp).
+ * `what` ("embedding" / "rerank") and `output_desc` name the request kind
+ * and the pooled output in error messages. */
+template <typename OnSeq>
+void run_packed_flushes(Session& sess,
+                        const std::vector<std::vector<llama_token>>& toks,
+                        const char* what, const char* output_desc,
+                        OnSeq&& on_seq) {
+    llama_context* ctx       = sess.ctx();
+    const uint32_t n_batch   = llama_n_batch(ctx);
+    const uint32_t n_seq_max = llama_n_seq_max(ctx);
 
-    /* 2. Model alias check. */
-    if (req.model != sess.model().alias()) {
-        throw Error(HELIX_E_MODEL_NOT_FOUND,
-                    "model '" + req.model + "' not loaded in this session",
-                    "model_not_found", "model", "helix_e_model_not_found");
-    }
-
-    llama_context*     ctx   = sess.ctx();
-    const llama_model* model = sess.model().llama_model_ptr();
-    const llama_vocab* vocab = llama_model_get_vocab(model);
-
-    const uint32_t n_batch    = llama_n_batch(ctx);
-    const uint32_t n_seq_max  = llama_n_seq_max(ctx);
-    const int32_t  n_embd_out = llama_model_n_embd_out(model);
-
-    /* 3. Tokenize every input up front — cheap, and it lets the whole
-     * request be validated before any compute is spent. */
-    std::vector<std::vector<llama_token>> toks(req.inputs.size());
-    std::vector<size_t> lengths(req.inputs.size());
-    int32_t total_tokens = 0;
-    for (size_t i = 0; i < req.inputs.size(); ++i) {
-        toks[i] = common_tokenize(vocab, req.inputs[i],
-                                  /*add_special=*/true, /*parse_special=*/true);
-        if (toks[i].empty()) {
-            throw Error(HELIX_E_VALIDATION,
-                        "input[" + std::to_string(i) + "] produced no tokens",
-                        "invalid_request_error", "input", "helix_e_validation");
-        }
-        if (toks[i].size() > n_batch) {
-            /* No silent truncation — mirrors the llama.cpp server guard. */
-            throw Error(HELIX_E_CONTEXT_FULL,
-                        "input[" + std::to_string(i) + "] is " +
-                        std::to_string(toks[i].size()) + " tokens; the "
-                        "session batch size is " + std::to_string(n_batch) +
-                        ". Shorten the input or raise n_batch/n_ctx in "
-                        "session options",
-                        "context_length_exceeded", "input",
-                        "helix_e_context_full");
-        }
-        lengths[i] = toks[i].size();
-        total_tokens += static_cast<int32_t>(toks[i].size());
-    }
-
-    warn_if_missing_eos_sep(vocab, toks);
-
-    /* 4. Pack → flush. The planner is the determinism-critical seam
-     * (insertion-ordered; see embed_packing.hpp). */
+    std::vector<size_t> lengths(toks.size());
+    for (size_t i = 0; i < toks.size(); ++i) lengths[i] = toks[i].size();
     const auto flushes = plan_embed_flushes(lengths, n_batch, n_seq_max);
-
-    EmbeddingsResponse resp;
-    resp.model         = sess.model().alias();
-    resp.encoding      = req.encoding;
-    resp.prompt_tokens = total_tokens;
-    resp.vectors.resize(req.inputs.size());
 
     llama_batch batch = llama_batch_init(static_cast<int32_t>(n_batch),
                                          /*embd=*/0,
@@ -132,8 +128,7 @@ helix_status_t run_embeddings(Session& sess,
          * State is only the KV memory, which the next flush clears, so the
          * session stays reusable after cancellation. */
         if (sess.cancel_flag().load(std::memory_order_relaxed)) {
-            throw Error(HELIX_E_CANCELLED, "request cancelled",
-                        "request_cancelled", "", "helix_e_cancelled");
+            throw_cancelled("request cancelled");
         }
 
         common_batch_clear(batch);
@@ -149,42 +144,82 @@ helix_status_t run_embeddings(Session& sess,
 
         const int32_t rc = run_one_batch(sess, batch);
         if (rc == 2) {
-            /* Abort-callback path. No abort_callback is installed in 1.1,
-             * but map it defensively so a future installation needs no
-             * change here. */
-            throw Error(HELIX_E_CANCELLED, "request cancelled",
-                        "request_cancelled", "", "helix_e_cancelled");
+            /* Abort-callback path. No abort_callback is installed, but map
+             * it defensively so a future installation needs no change here. */
+            throw_cancelled("request cancelled");
         }
         if (rc != 0) {
-            throw Error(HELIX_E_BACKEND,
-                        "llama_decode failed for embedding batch (rc=" +
-                        std::to_string(rc) + ")",
-                        "backend_error", "", "helix_e_backend");
+            throw_backend(std::string("llama_decode failed for ") + what +
+                          " batch (rc=" + std::to_string(rc) + ")");
         }
 
         for (size_t s = 0; s < group.size(); ++s) {
-            const float* emb = llama_get_embeddings_seq(
+            const float* pooled = llama_get_embeddings_seq(
                 ctx, static_cast<llama_seq_id>(s));
-            if (!emb) {
-                throw Error(HELIX_E_INTERNAL,
-                            "null sequence embedding (pooling misconfigured)",
-                            "internal_error", "", "helix_e_internal");
+            if (!pooled) {
+                throw_internal(std::string("null ") + output_desc +
+                               " (pooling misconfigured)");
             }
-            /* L2-normalize (euclidean), matching OpenAI's unit vectors. */
-            std::vector<float> v(static_cast<size_t>(n_embd_out));
-            common_embd_normalize(emb, v.data(), n_embd_out, /*embd_norm=*/2);
-            resp.vectors[group[s]] = std::move(v);
+            on_seq(group[s], pooled);
         }
     }
+}
+
+} // namespace
+
+helix_status_t run_embeddings(Session& sess,
+                              const char* request_json,
+                              char** out_response_json) {
+    /* 1. Parse and validate. Mode and alias gating mirror the chat path:
+     * the embedding-mode check lives in Session::embeddings. */
+    EmbeddingsRequest req =
+        EmbeddingsRequest::from_json(request_json ? request_json : "");
+    req.validate();
+
+    /* 2. Model alias check. */
+    sess.require_model_alias(req.model);
+
+    const llama_model* model = sess.model().llama_model_ptr();
+    const llama_vocab* vocab = llama_model_get_vocab(model);
+
+    const uint32_t n_batch    = llama_n_batch(sess.ctx());
+    const int32_t  n_embd_out = llama_model_n_embd_out(model);
+
+    /* 3. Tokenize every input up front — cheap, and it lets the whole
+     * request be validated before any compute is spent. */
+    std::vector<std::vector<llama_token>> toks(req.inputs.size());
+    int32_t total_tokens = 0;
+    for (size_t i = 0; i < req.inputs.size(); ++i) {
+        toks[i] = common_tokenize(vocab, req.inputs[i],
+                                  /*add_special=*/true, /*parse_special=*/true);
+        if (toks[i].empty()) {
+            throw_validation("input[" + std::to_string(i) + "] produced no tokens", "input");
+        }
+        require_fits_batch(toks[i], n_batch, "input[" + std::to_string(i) + "]",
+                           "input", "input");
+        total_tokens += static_cast<int32_t>(toks[i].size());
+    }
+
+    warn_if_missing_eos_sep(vocab, toks);
+
+    /* 4. Pack → flush → L2-normalize (euclidean), matching OpenAI's unit
+     * vectors. */
+    EmbeddingsResponse resp;
+    resp.model         = sess.model().alias();
+    resp.encoding      = req.encoding;
+    resp.prompt_tokens = total_tokens;
+    resp.vectors.resize(req.inputs.size());
+
+    run_packed_flushes(sess, toks, "embedding", "sequence embedding",
+                       [&](size_t index, const float* pooled) {
+        std::vector<float> v(static_cast<size_t>(n_embd_out));
+        common_embd_normalize(pooled, v.data(), n_embd_out, /*embd_norm=*/2);
+        resp.vectors[index] = std::move(v);
+    });
 
     /* 5. Serialize. */
-    const std::string json_str = resp.to_json();
     if (out_response_json) {
-        /* Allocated with C malloc() so the caller frees it via helix_free()
-         * — see the pairing note above helix_free in helix_abi.cpp. */
-        *out_response_json = static_cast<char*>(malloc(json_str.size() + 1));
-        if (!*out_response_json) throw std::bad_alloc();
-        std::copy_n(json_str.c_str(), json_str.size() + 1, *out_response_json);
+        *out_response_json = dup_for_caller(resp.to_json());
     }
 
     return HELIX_OK;
@@ -199,18 +234,12 @@ helix_status_t run_rerank(Session& sess,
     req.validate();
 
     /* 2. Model alias check. */
-    if (req.model != sess.model().alias()) {
-        throw Error(HELIX_E_MODEL_NOT_FOUND,
-                    "model '" + req.model + "' not loaded in this session",
-                    "model_not_found", "model", "helix_e_model_not_found");
-    }
+    sess.require_model_alias(req.model);
 
-    llama_context*     ctx   = sess.ctx();
     const llama_model* model = sess.model().llama_model_ptr();
     const llama_vocab* vocab = llama_model_get_vocab(model);
 
-    const uint32_t n_batch   = llama_n_batch(ctx);
-    const uint32_t n_seq_max = llama_n_seq_max(ctx);
+    const uint32_t n_batch = llama_n_batch(sess.ctx());
 
     /* 3. Build one token sequence per query+document pair, the same two
      * shapes llama-server uses: a model-supplied "rerank" chat template
@@ -227,13 +256,11 @@ helix_status_t run_rerank(Session& sess,
     }
 
     std::vector<std::vector<llama_token>> toks(req.documents.size());
-    std::vector<size_t> lengths(req.documents.size());
     int32_t total_tokens = 0;
     for (size_t i = 0; i < req.documents.size(); ++i) {
         if (rr_tmpl) {
-            std::string prompt = rr_tmpl;
-            string_replace_all(prompt, "{query}",    req.query);
-            string_replace_all(prompt, "{document}", req.documents[i]);
+            const std::string prompt =
+                format_rerank_prompt(rr_tmpl, req.query, req.documents[i]);
             toks[i] = common_tokenize(vocab, prompt,
                                       /*add_special=*/false,
                                       /*parse_special=*/true);
@@ -257,77 +284,23 @@ helix_status_t run_rerank(Session& sess,
         }
 
         if (toks[i].empty()) {
-            throw Error(HELIX_E_VALIDATION,
-                        "documents[" + std::to_string(i) +
-                        "] produced no tokens",
-                        "invalid_request_error", "documents",
-                        "helix_e_validation");
+            throw_validation("documents[" + std::to_string(i) +
+                             "] produced no tokens", "documents");
         }
-        if (toks[i].size() > n_batch) {
-            /* No silent truncation — same guard as the embeddings path. */
-            throw Error(HELIX_E_CONTEXT_FULL,
-                        "query + documents[" + std::to_string(i) + "] is " +
-                        std::to_string(toks[i].size()) + " tokens; the "
-                        "session batch size is " + std::to_string(n_batch) +
-                        ". Shorten the pair or raise n_batch/n_ctx in "
-                        "session options",
-                        "context_length_exceeded", "documents",
-                        "helix_e_context_full");
-        }
-        lengths[i] = toks[i].size();
+        require_fits_batch(toks[i], n_batch,
+                           "query + documents[" + std::to_string(i) + "]",
+                           "pair", "documents");
         total_tokens += static_cast<int32_t>(toks[i].size());
     }
 
     /* 4. Pack → flush → collect the rank-head score of each pair.
      * With rank pooling the pooled "embedding" is the classifier output;
      * scores are its first component (raw logit, matching llama-server). */
-    const auto flushes = plan_embed_flushes(lengths, n_batch, n_seq_max);
-
     std::vector<float> scores(req.documents.size(), 0.0f);
-
-    llama_batch batch = llama_batch_init(static_cast<int32_t>(n_batch),
-                                         /*embd=*/0,
-                                         static_cast<int32_t>(n_seq_max));
-    BatchGuard guard(batch);
-
-    for (const auto& group : flushes) {
-        if (sess.cancel_flag().load(std::memory_order_relaxed)) {
-            throw Error(HELIX_E_CANCELLED, "request cancelled",
-                        "request_cancelled", "", "helix_e_cancelled");
-        }
-
-        common_batch_clear(batch);
-        for (size_t s = 0; s < group.size(); ++s) {
-            const auto& t = toks[group[s]];
-            for (size_t p = 0; p < t.size(); ++p) {
-                common_batch_add(batch, t[p], static_cast<llama_pos>(p),
-                                 {static_cast<llama_seq_id>(s)}, true);
-            }
-        }
-
-        const int32_t rc = run_one_batch(sess, batch);
-        if (rc == 2) {
-            throw Error(HELIX_E_CANCELLED, "request cancelled",
-                        "request_cancelled", "", "helix_e_cancelled");
-        }
-        if (rc != 0) {
-            throw Error(HELIX_E_BACKEND,
-                        "llama_decode failed for rerank batch (rc=" +
-                        std::to_string(rc) + ")",
-                        "backend_error", "", "helix_e_backend");
-        }
-
-        for (size_t s = 0; s < group.size(); ++s) {
-            const float* emb = llama_get_embeddings_seq(
-                ctx, static_cast<llama_seq_id>(s));
-            if (!emb) {
-                throw Error(HELIX_E_INTERNAL,
-                            "null rank-head output (pooling misconfigured)",
-                            "internal_error", "", "helix_e_internal");
-            }
-            scores[group[s]] = emb[0];
-        }
-    }
+    run_packed_flushes(sess, toks, "rerank", "rank-head output",
+                       [&](size_t index, const float* pooled) {
+        scores[index] = pooled[0];
+    });
 
     /* 5. Sort descending by score; stable so equal scores keep input order
      * (determinism across runs and platforms). */
@@ -357,14 +330,8 @@ helix_status_t run_rerank(Session& sess,
         {"usage",   {{"prompt_tokens", total_tokens},
                      {"total_tokens",  total_tokens}}},
     };
-    const std::string json_str = out.dump();
-
     if (out_response_json) {
-        /* Allocated with C malloc() so the caller frees it via helix_free()
-         * — see the pairing note above helix_free in helix_abi.cpp. */
-        *out_response_json = static_cast<char*>(malloc(json_str.size() + 1));
-        if (!*out_response_json) throw std::bad_alloc();
-        std::copy_n(json_str.c_str(), json_str.size() + 1, *out_response_json);
+        *out_response_json = dup_for_caller(dump_json(out));
     }
 
     return HELIX_OK;

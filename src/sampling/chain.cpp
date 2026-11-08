@@ -1,6 +1,7 @@
 #include "chain.hpp"
 #include "../internal/log.hpp"
 #include "../json/request.hpp"
+#include "../chat/reasoning.hpp"
 
 #include "llama.h"
 #include "common.h"
@@ -24,7 +25,7 @@ void SamplerDeleter::operator()(llama_sampler* s) const {
 }
 
 SamplerPtr build_sampler_chain(const ChatRequest& req,
-                                unsigned int seed_override,
+                                std::optional<uint32_t> seed_override,
                                 const llama_vocab* vocab,
                                 const std::string& grammar,
                                 bool grammar_lazy,
@@ -48,8 +49,8 @@ SamplerPtr build_sampler_chain(const ChatRequest& req,
     static constexpr int32_t kDefaultPenaltyWindow = 64;
 
     uint32_t seed;
-    if (seed_override != 0) {
-        seed = seed_override;
+    if (seed_override) {
+        seed = *seed_override;
     } else if (req.seed) {
         seed = *req.seed;
     } else {
@@ -146,10 +147,8 @@ SamplerPtr build_sampler_chain(const ChatRequest& req,
          * ("</think>" -> "<think>") as a fallback so the budget stays live. */
         std::string start_tag = thinking_start_tag;
         if (start_tag.empty() && !thinking_forced_open) {
-            const auto slash = thinking_end_tag.find('/');
-            if (slash != std::string::npos) {
-                start_tag = thinking_end_tag;
-                start_tag.erase(slash, 1);
+            if (thinking_end_tag.find('/') != std::string::npos) {
+                start_tag = resolve_thinking_start_tag("", thinking_end_tag);
                 log_debug("reasoning_budget: template supplied no thinking start "
                           "tag; watching for \"" + start_tag + "\" derived from "
                           "the end tag");
@@ -216,19 +215,21 @@ std::vector<llama_token> helix_sample_and_accept_n(
         const std::vector<int>&   idxs,
         const std::vector<llama_token>& draft) {
     /* Port of common_sampler_sample_and_accept_n (common/sampling.cpp) over
-     * the raw llama_sampler chain. idxs.size() == draft.size() + 1. */
+     * the raw llama_sampler chain. idxs.size() == draft.size() + 1.
+     * Unlike common_sampler_sample, llama_sampler_sample already accepts the
+     * sampled token into the chain; the upstream explicit accept step must
+     * not be ported, or penalties/grammar/reasoning-budget state advance
+     * twice per token. */
     std::vector<llama_token> result;
     result.reserve(idxs.size());
     size_t i = 0;
     for (; i < draft.size(); ++i) {
         llama_token id = llama_sampler_sample(sampler, ctx, idxs[i]);
-        llama_sampler_accept(sampler, id);
         result.push_back(id);
         if (draft[i] != id) break;       /* mismatch - reject the rest */
     }
     if (i == draft.size()) {             /* all drafts matched - sample bonus */
         llama_token id = llama_sampler_sample(sampler, ctx, idxs[i]);
-        llama_sampler_accept(sampler, id);
         result.push_back(id);
     }
     return result;

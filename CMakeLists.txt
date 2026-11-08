@@ -71,10 +71,10 @@ string(SUBSTRING "${HELIX_LLAMACPP_SHA}" 0 12 HELIX_LLAMACPP_SHA_SHORT)
 # ------------------------------------------------------------------
 #  Platform-specific CPU probe source
 # ------------------------------------------------------------------
+# cpu_linux.cpp carries the /proc-based Linux probe plus the portable
+# std::thread fallback used on every other non-Windows platform (macOS).
 if(WIN32)
     set(HELIX_CPU_PROBE_SRC src/hardware/cpu_windows.cpp)
-elseif(APPLE)
-    set(HELIX_CPU_PROBE_SRC src/hardware/cpu_macos.cpp)   # added in Phase 4
 else()
     set(HELIX_CPU_PROBE_SRC src/hardware/cpu_linux.cpp)
 endif()
@@ -121,31 +121,10 @@ if(HELIX_BACKEND STREQUAL "cuda" OR HELIX_BACKEND STREQUAL "omni")
 endif()
 
 # ------------------------------------------------------------------
-#  Shared library target
+#  Shared build settings for the shared and static library targets
 # ------------------------------------------------------------------
-add_library(helix SHARED ${HELIX_SOURCES})
-
-string(TOUPPER "${HELIX_BACKEND}" _HELIX_BACKEND_UPPER)
-target_compile_definitions(helix PRIVATE
-    HELIX_BUILD_SHARED
-    HELIX_LLAMACPP_SHA="${HELIX_LLAMACPP_SHA_SHORT}"
-    HELIX_BACKEND_${_HELIX_BACKEND_UPPER}=1
-    HELIX_MAX_DECODE_THREADS=${HELIX_MAX_DECODE_THREADS}
-)
-if(HELIX_BACKEND STREQUAL "cuda" OR HELIX_BACKEND STREQUAL "omni")
-    target_compile_definitions(helix PRIVATE HELIX_HAS_CUDA=1)
-endif()
-if(HELIX_BACKEND STREQUAL "metal" OR HELIX_BACKEND STREQUAL "omni")
-    target_compile_definitions(helix PRIVATE HELIX_HAS_METAL=1)
-endif()
-if(HELIX_BACKEND STREQUAL "vulkan" OR HELIX_BACKEND STREQUAL "omni")
-    target_compile_definitions(helix PRIVATE HELIX_HAS_VULKAN=1)
-endif()
-if(HELIX_BACKEND STREQUAL "rocm" OR HELIX_BACKEND STREQUAL "omni")
-    target_compile_definitions(helix PRIVATE HELIX_HAS_ROCM=1)
-endif()
-
-target_include_directories(helix PRIVATE
+# Include directories for library sources (tests/ reuses this list).
+set(HELIX_PRIVATE_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/include
@@ -155,7 +134,50 @@ target_include_directories(helix PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/tools/mtmd
 )
 
-# Hide all symbols by default — only the 16 exported ones are visible.
+# Backend -> HELIX_HAS_* mapping, spelled out once. cuda_lock.hpp keys the
+# per-model decode lock on HELIX_HAS_CUDA || HELIX_HAS_ROCM, so every target
+# compiling the library sources must receive the same set.
+string(TOUPPER "${HELIX_BACKEND}" _HELIX_BACKEND_UPPER)
+set(HELIX_BACKEND_DEFINITIONS HELIX_BACKEND_${_HELIX_BACKEND_UPPER}=1)
+foreach(_backend cuda metal vulkan rocm)
+    if(HELIX_BACKEND STREQUAL _backend OR HELIX_BACKEND STREQUAL "omni")
+        string(TOUPPER "${_backend}" _upper)
+        list(APPEND HELIX_BACKEND_DEFINITIONS HELIX_HAS_${_upper}=1)
+    endif()
+endforeach()
+
+function(helix_configure_target tgt)
+    target_compile_definitions(${tgt} PRIVATE
+        HELIX_LLAMACPP_SHA="${HELIX_LLAMACPP_SHA_SHORT}"
+        HELIX_MAX_DECODE_THREADS=${HELIX_MAX_DECODE_THREADS}
+        ${HELIX_BACKEND_DEFINITIONS}
+    )
+    target_include_directories(${tgt} PRIVATE ${HELIX_PRIVATE_INCLUDE_DIRS})
+    # llama + common + mtmd are PRIVATE (symbols hidden from consumers).
+    target_link_libraries(${tgt} PRIVATE llama llama-common mtmd)
+    if(HELIX_BACKEND STREQUAL "cuda" OR HELIX_BACKEND STREQUAL "omni")
+        target_link_libraries(${tgt} PRIVATE CUDA::cudart)
+    endif()
+    if(MSVC)
+        target_compile_options(${tgt} PRIVATE /W4 /permissive- /Zc:__cplusplus /Zc:preprocessor)
+    else()
+        target_compile_options(${tgt} PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    endif()
+    # Windows: keep <windows.h> from defining min/max macros and pull in a
+    # leaner header surface (fewer macro collisions, faster compiles).
+    if(WIN32)
+        target_compile_definitions(${tgt} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    endif()
+endfunction()
+
+# ------------------------------------------------------------------
+#  Shared library target
+# ------------------------------------------------------------------
+add_library(helix SHARED ${HELIX_SOURCES})
+helix_configure_target(helix)
+target_compile_definitions(helix PRIVATE HELIX_BUILD_SHARED)
+
+# Hide all symbols by default — only the helix.h exports are visible.
 set_target_properties(helix PROPERTIES
     C_VISIBILITY_PRESET   hidden
     CXX_VISIBILITY_PRESET hidden
@@ -182,12 +204,6 @@ if(APPLE)
     if(HELIX_UNIVERSAL_BINARY)
         set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "" FORCE)
     endif()
-endif()
-
-# Link llama + common + mtmd as PRIVATE (symbols hidden from consumers).
-target_link_libraries(helix PRIVATE llama llama-common mtmd)
-if(HELIX_BACKEND STREQUAL "cuda" OR HELIX_BACKEND STREQUAL "omni")
-    target_link_libraries(helix PRIVATE CUDA::cudart)
 endif()
 
 # Platform-specific symbol export control.
@@ -217,43 +233,7 @@ add_library(helix_static STATIC ${HELIX_SOURCES})
 if(NOT WIN32)
     set_target_properties(helix_static PROPERTIES OUTPUT_NAME helix)
 endif()
-target_compile_definitions(helix_static PRIVATE
-    HELIX_LLAMACPP_SHA="${HELIX_LLAMACPP_SHA_SHORT}"
-    HELIX_BACKEND_${_HELIX_BACKEND_UPPER}=1
-    HELIX_MAX_DECODE_THREADS=${HELIX_MAX_DECODE_THREADS}
-)
-if(HELIX_BACKEND STREQUAL "cuda" OR HELIX_BACKEND STREQUAL "omni")
-    target_compile_definitions(helix_static PRIVATE HELIX_HAS_CUDA=1)
-endif()
-target_include_directories(helix_static PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/common
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/ggml/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/tools/mtmd
-)
-target_link_libraries(helix_static PRIVATE llama llama-common mtmd)
-if(HELIX_BACKEND STREQUAL "cuda" OR HELIX_BACKEND STREQUAL "omni")
-    target_link_libraries(helix_static PRIVATE CUDA::cudart)
-endif()
-
-# Compiler warnings (after both shared and static targets exist).
-if(MSVC)
-    target_compile_options(helix        PRIVATE /W4 /permissive- /Zc:__cplusplus /Zc:preprocessor)
-    target_compile_options(helix_static PRIVATE /W4 /permissive- /Zc:__cplusplus /Zc:preprocessor)
-else()
-    target_compile_options(helix        PRIVATE -Wall -Wextra -Wno-unused-parameter)
-    target_compile_options(helix_static PRIVATE -Wall -Wextra -Wno-unused-parameter)
-endif()
-
-# Windows: keep <windows.h> from defining min/max macros and pull in a leaner
-# header surface (fewer macro collisions, faster compiles).
-if(WIN32)
-    target_compile_definitions(helix        PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-    target_compile_definitions(helix_static PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-endif()
+helix_configure_target(helix_static)
 
 # ------------------------------------------------------------------
 #  Install rules

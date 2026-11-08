@@ -12,23 +12,15 @@ FetchContent_MakeAvailable(googletest)
 
 include(GoogleTest)
 
-# Common include path for all tests.
+# Common include path for all tests: the library's own list plus src/.
 set(HELIX_TEST_INCLUDES
-    ${CMAKE_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/third_party
-    ${CMAKE_SOURCE_DIR}/third_party/llama.cpp/include
-    ${CMAKE_SOURCE_DIR}/third_party/llama.cpp/common
-    ${CMAKE_SOURCE_DIR}/third_party/llama.cpp/ggml/include
-    ${CMAKE_SOURCE_DIR}/third_party/llama.cpp/vendor
-    ${CMAKE_SOURCE_DIR}/third_party/llama.cpp/tools/mtmd
+    ${HELIX_PRIVATE_INCLUDE_DIRS}
     ${CMAKE_SOURCE_DIR}/src
 )
 
 # Platform-specific CPU probe source (mirrors the library build).
 if(WIN32)
     set(HELIX_CPU_PROBE_SRC ${CMAKE_SOURCE_DIR}/src/hardware/cpu_windows.cpp)
-elseif(APPLE)
-    set(HELIX_CPU_PROBE_SRC ${CMAKE_SOURCE_DIR}/src/hardware/cpu_macos.cpp)
 else()
     set(HELIX_CPU_PROBE_SRC ${CMAKE_SOURCE_DIR}/src/hardware/cpu_linux.cpp)
 endif()

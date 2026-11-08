@@ -25,9 +25,8 @@ MmProj::MmProj(const char* mmproj_path,
 
     ctx_ = mtmd_init_from_file(mmproj_path, text_model, p);
     if (!ctx_) {
-        throw Error(HELIX_E_MODEL_LOAD_FAILED,
-                    std::string("failed to load mmproj: ") + mmproj_path,
-                    "model_load_failed", "mmproj_path", "helix_e_model_load_failed");
+        throw_model_load_failed(std::string("failed to load mmproj: ") + mmproj_path,
+                                "mmproj_path");
     }
 
     supports_vision_ = mtmd_support_vision(ctx_);
@@ -55,14 +54,12 @@ llama_pos MmProj::eval_media(
 
     for (const auto& raw : media_bytes) {
         if (raw.empty()) {
-            throw Error(HELIX_E_VALIDATION,
-                        "media payload is empty",
-                        "invalid_request_error", "messages", "helix_e_validation");
+            throw_validation("media payload is empty", "messages");
         }
         if (raw.size() > kMaxMediaRawBytes) {
-            throw Error(HELIX_E_VALIDATION,
-                        "media payload exceeds " + std::to_string(kMaxMediaRawBytes / (1024 * 1024)) + " MiB limit",
-                        "invalid_request_error", "messages", "helix_e_validation");
+            throw_validation("media payload exceeds "
+                             + std::to_string(kMaxMediaRawBytes / (1024 * 1024)) + " MiB limit",
+                             "messages");
         }
     }
 
@@ -84,9 +81,8 @@ llama_pos MmProj::eval_media(
 
         BitmapPtr bmp(wrapper.bitmap, bitmap_deleter);
         if (!bmp) {
-            throw Error(HELIX_E_VALIDATION,
-                        "failed to decode media payload (unsupported format or corrupt data)",
-                        "invalid_request_error", "messages", "helix_e_validation");
+            throw_validation("failed to decode media payload (unsupported format or corrupt data)",
+                             "messages");
         }
         bitmaps.push_back(std::move(bmp));
     }
@@ -115,10 +111,9 @@ llama_pos MmProj::eval_media(
     bitmaps.clear();
 
     if (tok_res != 0) {
-        throw Error(HELIX_E_VALIDATION,
-                    "mtmd_tokenize failed (code " + std::to_string(tok_res) +
-                    "); check that the number of media parts matches markers in the prompt",
-                    "invalid_request_error", "messages", "helix_e_validation");
+        throw_validation("mtmd_tokenize failed (code " + std::to_string(tok_res) +
+                         "); check that the number of media parts matches markers in the prompt",
+                         "messages");
     }
 
     /* Eval all chunks into the llama context. */
@@ -136,9 +131,7 @@ llama_pos MmProj::eval_media(
     chunks_guard.reset();
 
     if (eval_res != 0) {
-        throw Error(HELIX_E_BACKEND,
-                    "mtmd_helper_eval_chunks failed (code " + std::to_string(eval_res) + ")",
-                    "backend_error", "", "helix_e_backend");
+        throw_backend("mtmd_helper_eval_chunks failed (code " + std::to_string(eval_res) + ")");
     }
 
     return new_n_past;

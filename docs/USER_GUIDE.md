@@ -363,7 +363,7 @@ void helix_session_cancel(helix_session_t* session);
 
 Cooperately cancels any in-flight `helix_chat_completions` or `helix_chat_completions_stream` call on this session. Safe to call from any thread. Cancellation is detected at the start of each decode step and within the prefill loop.
 
-After cancellation, the session can be reused for a new request.
+After cancellation, the session can be reused for a new request. Calling it while no request is in flight does nothing: the cancel is not remembered for the next request, and a call still queued behind another request on the same session is not cancelled.
 
 #### `helix_session_save` / `helix_session_restore` *(added in 1.5)*
 
@@ -702,13 +702,16 @@ Passed as an optional JSON string to `helix_runtime_create`. All fields are opti
 
 ```jsonc
 {
-  // Device selection: "auto" | "cpu" | "cuda:N" (e.g. "cuda:0")
+  // Device selection: "auto" | "cpu". "cpu" keeps every model (and any
+  // speculative draft model or mmproj) off the GPU, overriding n_gpu_layers.
+  // Other values are ignored with a warning and treated as "auto".
   "device_preference": "auto",
 
   // Log level: "off" | "error" | "warn" | "info" | "debug" | "trace"
   "log_level": "warn",
 
-  // Deterministic mode: force seed=0 for reproducible results
+  // Deterministic mode: requests that omit "seed" are sampled as if they
+  // passed "seed": 0. An explicit request seed still wins.
   "deterministic": false
 }
 ```
@@ -1311,16 +1314,18 @@ const char* req = R"({
 | Data URI | `data:image/{png,jpeg,webp,gif,bmp};base64,...` | Embedded base64 |
 | File URI | `file:///absolute/path/to/image.png` | Local file (absolute path only) |
 
+Set `HELIX_FILE_URI_ROOT` to restrict `file://` URLs to one directory; without it any file the process can read may be referenced. See `SECURITY.md` for this and other notes on serving untrusted requests, including special-token text in message content.
+
 **Supported audio format:** `input_audio` with `format: "mp3"` or `"wav"`, data as base64.
 
 **Prerequisite:** The model must be loaded with `"mmproj_path"` pointing to the multimodal projector GGUF file.
 
 ### 5.7 Reasoning Extraction
 
-For reasoning models like DeepSeek-R1 and QwQ, Helix automatically extracts `<think>...</think>` blocks:
+For reasoning models like DeepSeek-R1 and QwQ, Helix automatically extracts the thinking block. The tags come from the model's chat template (`<think>...</think>` for most models, `[THINK]...[/THINK]` for Magistral-style templates, and so on), falling back to `<think>...</think>` when the template names none:
 
-- Content inside `<think>` tags is delivered as `reasoning_content` in the response.
-- Content outside `<think>` tags is delivered as regular `content`.
+- Content inside the thinking tags is delivered as `reasoning_content` in the response.
+- Content outside them is delivered as regular `content`.
 - The `reasoning_format` model option controls extraction: `"auto"`, `"deepseek-r1"`, `"qwq"`, or `"none"`.
 
 **Non-streaming response with reasoning:**

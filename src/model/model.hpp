@@ -8,6 +8,7 @@
 
 /* Forward-declare llama types to avoid leaking them. */
 struct llama_model;
+struct llama_model_params;
 struct llama_adapter_lora;
 
 namespace helix {
@@ -64,6 +65,10 @@ public:
     const std::string&  describe()        const { return describe_json_; }
     Runtime&            runtime()         const { return rt_; }
     int                 n_gpu_layers_actual() const { return n_gpu_layers_actual_; }
+
+    /* Applies the runtime's device_preference to load params for this model
+     * or a model loaded alongside it ("cpu" removes every offload device). */
+    void apply_device_preference(llama_model_params& params) const;
 
     // Per-model CUDA lock (acquired before the per-session lock on CUDA builds).
     std::mutex& cuda_mu() { return cuda_mu_; }

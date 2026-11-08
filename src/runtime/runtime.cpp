@@ -2,6 +2,8 @@
 #include "../hardware/profile.hpp"
 #include "../internal/error.hpp"
 #include "../internal/version.hpp"
+#include "../util/json_dump.hpp"
+#include "../util/json_parse.hpp"
 #include "llama.h"
 #include "nlohmann/json.hpp"
 
@@ -18,18 +20,22 @@ RuntimeOptions parse_runtime_options(const char* options_json) {
     RuntimeOptions opts;
     if (!options_json || options_json[0] == '\0') return opts;
 
-    nj j;
-    try {
-        j = nj::parse(options_json);
-    } catch (const nj::parse_error& e) {
-        throw_invalid_json(std::string("runtime options JSON parse error: ") + e.what());
-    }
+    nj j = parse_json_object<nj>(options_json, "runtime options",
+                                 /*null_is_empty=*/true);
 
-    if (j.contains("device_preference") && j["device_preference"].is_string())
-        opts.device_preference = j["device_preference"].get<std::string>();
+    if (j.contains("device_preference") && j["device_preference"].is_string()) {
+        const auto& pref = j["device_preference"].get<std::string>();
+        if (pref == "auto" || pref == "cpu") {
+            opts.device_preference = pref;
+        } else {
+            log_warn("unsupported device_preference '" + pref +
+                     "' (expected \"auto\" or \"cpu\"); using \"auto\"");
+        }
+    }
 
     if (j.contains("log_level") && j["log_level"].is_string()) {
         const auto& lvl = j["log_level"].get<std::string>();
+        opts.log_level_set = true;
         if      (lvl == "off")   opts.log_level = HELIX_LOG_OFF;
         else if (lvl == "error") opts.log_level = HELIX_LOG_ERROR;
         else if (lvl == "warn")  opts.log_level = HELIX_LOG_WARN;
@@ -37,6 +43,7 @@ RuntimeOptions parse_runtime_options(const char* options_json) {
         else if (lvl == "debug") opts.log_level = HELIX_LOG_DEBUG;
         else if (lvl == "trace") opts.log_level = HELIX_LOG_TRACE;
         else {
+            opts.log_level_set = false;
             log_warn("unknown log_level '" + lvl + "'; ignoring");
         }
     }
@@ -67,14 +74,25 @@ static void llama_log_redirect(ggml_log_level level, const char* text, void* /*u
 Runtime::Runtime(const RuntimeOptions& opts) : opts_(opts) {
     std::lock_guard<std::mutex> init_guard(s_backend_init_mu);
     if (s_runtime_count == 0) {
-        Logger::instance().min_level.store(opts.log_level, std::memory_order_relaxed);
+        if (opts.log_level_set) {
+            Logger::instance().min_level.store(opts.log_level,
+                                               std::memory_order_relaxed);
+        }
         llama_log_set(llama_log_redirect, nullptr);
         llama_backend_init();
     }
     ++s_runtime_count;
-    profile_ = probe_hardware();
-    build_describe();
-    log_info("helix runtime initialised (phase 5, " +
+    /* A throwing constructor never runs the destructor: undo the refcount
+     * (and the backend init it may have performed) on failure. */
+    try {
+        profile_ = probe_hardware();
+        build_describe();
+    } catch (...) {
+        if (--s_runtime_count == 0) llama_backend_free();
+        throw;
+    }
+    log_info("helix runtime initialised (phase " +
+             std::to_string(HELIX_PROGRAM_PHASE) + ", " +
              std::to_string(profile_.accelerators.size()) + " accelerator(s))");
 }
 
@@ -163,7 +181,7 @@ void Runtime::build_describe() {
         {"flash_attn",      pick_flash_attn(profile_)},
     };
 
-    describe_json_ = j.dump(2);
+    describe_json_ = dump_json(j, 2);
 }
 
 } // namespace helix

@@ -17,6 +17,7 @@
 #include "../model/model.hpp"
 #include "../internal/error.hpp"
 #include "../internal/log.hpp"
+#include "../util/fs_path.hpp"
 
 #include "llama.h"
 
@@ -57,46 +58,32 @@ static_assert(sizeof(StateHeader) == 40, "StateHeader layout is the file format"
  * names the actual reason the session cannot persist. */
 void Session::require_persistable(const char* what) const {
     if (opts_.embedding) {
-        throw Error(HELIX_E_UNSUPPORTED_FEATURE,
-                    std::string(what) + " is not supported for embedding "
-                    "sessions (KV is cleared every flush; there is no state "
-                    "to persist)",
-                    "unsupported_feature_error", "session",
-                    "helix_e_unsupported_feature");
+        throw_unsupported(std::string(what) + " is not supported for embedding "
+                          "sessions (KV is cleared every flush; there is no state "
+                          "to persist)", "session");
     }
     if (opts_.speculative.type != SpeculativeType::None) {
-        throw Error(HELIX_E_UNSUPPORTED_FEATURE,
-                    std::string(what) + " is not supported for speculative "
-                    "(MTP) sessions in this release",
-                    "unsupported_feature_error", "session",
-                    "helix_e_unsupported_feature");
+        throw_unsupported(std::string(what) + " is not supported for speculative "
+                          "(MTP) sessions in this release", "session");
     }
     if (!opts_.prefix_cache) {
-        throw Error(HELIX_E_UNSUPPORTED_FEATURE,
-                    std::string(what) + " requires the prefix cache "
-                    "(session option \"prefix_cache\": true): restored KV "
-                    "state is only used through prefix matching",
-                    "unsupported_feature_error", "session",
-                    "helix_e_unsupported_feature");
+        throw_unsupported(std::string(what) + " requires the prefix cache "
+                          "(session option \"prefix_cache\": true): restored KV "
+                          "state is only used through prefix matching", "session");
     }
     if (!active_loras_.empty()) {
-        throw Error(HELIX_E_UNSUPPORTED_FEATURE,
-                    std::string(what) + " is not supported for sessions with "
-                    "active lora adapters in this release (the state file "
-                    "does not record the adapter set, so a restore could "
-                    "silently mix KV computed under different adapters)",
-                    "unsupported_feature_error", "session",
-                    "helix_e_unsupported_feature");
+        throw_unsupported(std::string(what) + " is not supported for sessions with "
+                          "active lora adapters in this release (the state file "
+                          "does not record the adapter set, so a restore could "
+                          "silently mix KV computed under different adapters)",
+                          "session");
     }
 }
 
 helix_status_t Session::save_state(const char* path) {
-#if HELIX_CUDA_REQUIRES_GLOBAL_LOCK
-    std::lock_guard<std::mutex> cuda_guard(model_.cuda_mu());
-#endif
     /* Waits for any in-flight request (one inference at a time), then holds
      * the session so the KV cannot change under the serialization. */
-    std::lock_guard<std::mutex> guard(mu_);
+    CallGuard guard(*this, /*cancellable=*/false);
 
     require_persistable("helix_session_save");
 
@@ -104,9 +91,7 @@ helix_status_t Session::save_state(const char* path) {
     std::vector<uint8_t> blob(state_size);
     const size_t copied = llama_state_get_data(ctx_, blob.data(), blob.size());
     if (copied == 0 || copied > state_size) {
-        throw Error(HELIX_E_INTERNAL,
-                    "llama_state_get_data failed",
-                    "internal_error", "", "helix_e_internal");
+        throw_internal("llama_state_get_data failed");
     }
 
     StateHeader hdr{};
@@ -122,11 +107,9 @@ helix_status_t Session::save_state(const char* path) {
      * ENOSPC mid-write never leaves a truncated file at `path`. */
     const std::string tmp_path = std::string(path) + ".tmp";
     {
-        std::ofstream f(tmp_path, std::ios::binary | std::ios::trunc);
+        std::ofstream f(utf8_path(tmp_path), std::ios::binary | std::ios::trunc);
         if (!f) {
-            throw Error(HELIX_E_INVALID_ARG,
-                        "cannot open for writing: " + tmp_path,
-                        "invalid_request_error", "path", "helix_e_invalid_arg");
+            throw_invalid_arg("cannot open for writing: " + tmp_path, "path");
         }
         f.write(reinterpret_cast<const char*>(&hdr), sizeof hdr);
         if (!last_tokens_.empty()) {
@@ -140,21 +123,17 @@ helix_status_t Session::save_state(const char* path) {
         if (!f) {
             f.close();
             std::error_code ec;
-            std::filesystem::remove(tmp_path, ec);
-            throw Error(HELIX_E_INTERNAL,
-                        "I/O error writing session state to " + tmp_path,
-                        "internal_error", "path", "helix_e_internal");
+            std::filesystem::remove(utf8_path(tmp_path), ec);
+            throw_internal("I/O error writing session state to " + tmp_path, "path");
         }
     }
 
     std::error_code ec;
-    std::filesystem::rename(tmp_path, path, ec);
+    std::filesystem::rename(utf8_path(tmp_path), utf8_path(path), ec);
     if (ec) {
         std::error_code ec2;
-        std::filesystem::remove(tmp_path, ec2);
-        throw Error(HELIX_E_INTERNAL,
-                    "cannot rename " + tmp_path + " into place: " + ec.message(),
-                    "internal_error", "path", "helix_e_internal");
+        std::filesystem::remove(utf8_path(tmp_path), ec2);
+        throw_internal("cannot rename " + tmp_path + " into place: " + ec.message(), "path");
     }
 
     log_info("session state saved: " + std::string(path) + " (" +
@@ -164,20 +143,15 @@ helix_status_t Session::save_state(const char* path) {
 }
 
 helix_status_t Session::restore_state(const char* path) {
-#if HELIX_CUDA_REQUIRES_GLOBAL_LOCK
-    std::lock_guard<std::mutex> cuda_guard(model_.cuda_mu());
-#endif
-    std::lock_guard<std::mutex> guard(mu_);
+    CallGuard guard(*this, /*cancellable=*/false);
 
     require_persistable("helix_session_restore");
 
     /* All file reading and header validation happens BEFORE the context is
      * touched, so a rejected file leaves existing session state intact. */
-    std::ifstream f(path, std::ios::binary);
+    std::ifstream f(utf8_path(path), std::ios::binary);
     if (!f) {
-        throw Error(HELIX_E_INVALID_ARG,
-                    "cannot open session state file: " + std::string(path),
-                    "invalid_request_error", "path", "helix_e_invalid_arg");
+        throw_invalid_arg("cannot open session state file: " + std::string(path), "path");
     }
 
     StateHeader hdr{};
@@ -205,6 +179,17 @@ helix_status_t Session::restore_state(const char* path) {
     if (hdr.n_tokens > hdr.n_ctx) {
         throw_state_mismatch("session state file is corrupt "
                              "(token history exceeds n_ctx)");
+    }
+    /* Bound the allocations below by what the file actually holds, so a
+     * damaged size field is reported as corruption rather than as an
+     * out-of-memory (or a multi-gigabyte allocation). */
+    std::error_code size_ec;
+    const uintmax_t file_size = std::filesystem::file_size(utf8_path(path), size_ec);
+    const uint64_t  payload   = hdr.n_tokens * sizeof(llama_token);
+    if (size_ec || file_size < sizeof hdr + payload ||
+        hdr.state_size > file_size - sizeof hdr - payload) {
+        throw_state_mismatch("session state file is truncated: " +
+                             std::string(path));
     }
 
     std::vector<llama_token> tokens(static_cast<size_t>(hdr.n_tokens));

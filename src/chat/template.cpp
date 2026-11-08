@@ -1,4 +1,5 @@
 #include "template.hpp"
+#include "reasoning.hpp"
 #include "../internal/error.hpp"
 #include "../json/request.hpp"
 
@@ -172,16 +173,8 @@ RenderResult render_prompt(const std::vector<Message>& messages,
      * agree. Fall back to deriving it from the end tag (drop the '/':
      * "</think>" -> "<think>", "[/THINK]" -> "[THINK]"). */
     if (result.extract_reasoning && result.supports_thinking) {
-        std::string open_tag = result.thinking_start_tag;
-        if (open_tag.empty()) {
-            open_tag = result.thinking_end_tag.empty()
-                       ? std::string("<think>")
-                       : result.thinking_end_tag;
-            const auto slash = open_tag.find('/');
-            if (slash != std::string::npos) {
-                open_tag.erase(slash, 1);
-            }
-        }
+        const std::string open_tag = resolve_thinking_start_tag(
+            result.thinking_start_tag, result.thinking_end_tag);
         std::string_view tail(result.prompt);
         while (!tail.empty() &&
                (tail.back() == '\n' || tail.back() == '\r' ||

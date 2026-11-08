@@ -220,3 +220,65 @@ TEST(ReasoningExtract, TokenByToken) {
     EXPECT_EQ(all_reasoning, "think step");
     EXPECT_EQ(all_content, "answer text");
 }
+
+/* ---- template-supplied tags ---- */
+
+static ReasoningOutput push_flush(ReasoningExtractor& ex, const std::string& text) {
+    auto out   = ex.push(text);
+    auto flush = ex.flush();
+    out.reasoning += flush.reasoning;
+    out.content   += flush.content;
+    return out;
+}
+
+TEST(ReasoningExtract, CustomBracketTags) {
+    ReasoningExtractor ex(true, false, "[THINK]", "[/THINK]");
+    auto out = push_flush(ex, "[THINK]plan it[/THINK]final answer");
+    EXPECT_EQ(out.reasoning, "plan it");
+    EXPECT_EQ(out.content, "final answer");
+}
+
+TEST(ReasoningExtract, CustomTagsTokenByToken) {
+    ReasoningExtractor ex(true, false, "<|channel>thought", "<channel|>");
+    const std::string input = "<|channel>thoughtweigh options<channel|>pick B";
+    std::string all_reasoning, all_content;
+    for (char c : input) {
+        auto out = ex.push(std::string_view(&c, 1));
+        all_reasoning += out.reasoning;
+        all_content   += out.content;
+    }
+    auto flush = ex.flush();
+    all_reasoning += flush.reasoning;
+    all_content   += flush.content;
+    EXPECT_EQ(all_reasoning, "weigh options");
+    EXPECT_EQ(all_content, "pick B");
+}
+
+TEST(ReasoningExtract, CustomTagsIgnoreDefaultThinkTags) {
+    ReasoningExtractor ex(true, false, "[THINK]", "[/THINK]");
+    auto out = push_flush(ex, "<think>not reasoning</think>");
+    EXPECT_EQ(out.reasoning, "");
+    EXPECT_EQ(out.content, "<think>not reasoning</think>");
+}
+
+TEST(ReasoningExtract, CustomTagsForcedOpen) {
+    ReasoningExtractor ex(true, /*start_in_think=*/true, "[THINK]", "[/THINK]");
+    auto out = push_flush(ex, "already thinking[/THINK]done");
+    EXPECT_EQ(out.reasoning, "already thinking");
+    EXPECT_EQ(out.content, "done");
+}
+
+TEST(ReasoningExtract, EmptyTagsFallBackToThink) {
+    ReasoningExtractor ex(true, false, "", "");
+    auto out = push_flush(ex, "<think>r</think>c");
+    EXPECT_EQ(out.reasoning, "r");
+    EXPECT_EQ(out.content, "c");
+}
+
+TEST(ReasoningExtract, ResolveThinkingStartTag) {
+    EXPECT_EQ(resolve_thinking_start_tag("<|channel>thought", "<channel|>"),
+              "<|channel>thought");
+    EXPECT_EQ(resolve_thinking_start_tag("", "[/THINK]"), "[THINK]");
+    EXPECT_EQ(resolve_thinking_start_tag("", "</think>"), "<think>");
+    EXPECT_EQ(resolve_thinking_start_tag("", ""), "<think>");
+}

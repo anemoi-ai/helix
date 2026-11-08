@@ -19,7 +19,9 @@ std::vector<uint8_t> decode_image_data_uri(const std::string& uri);
 
 /* Read a file:// URI into raw bytes.
  * Validates the path is absolute. Rejects non-existent or unreadable files.
- * max_bytes caps the allocation; throws HELIX_E_VALIDATION if exceeded. */
+ * max_bytes caps the allocation; throws HELIX_E_VALIDATION if exceeded.
+ * Every failure that depends on filesystem state (missing, unreadable, too
+ * large, outside HELIX_FILE_URI_ROOT) throws the same message. */
 std::vector<uint8_t> load_file_uri(const std::string& uri,
                                     size_t max_bytes = kMaxMediaRawBytes);
 

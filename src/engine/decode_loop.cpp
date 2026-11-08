@@ -4,13 +4,16 @@
 #include "../json/response.hpp"
 #include "../chat/template.hpp"
 #include "../chat/reasoning.hpp"
+#include "../multimodal/image_decode.hpp"
 #include "../multimodal/mmproj.hpp"
 #include "../sampling/chain.hpp"
 #include "../sampling/logit_bias.hpp"
 #include "../grammar/response_format.hpp"
+#include "../internal/caller_alloc.hpp"
 #include "../internal/error.hpp"
 #include "../internal/log.hpp"
 #include "../internal/version.hpp"
+#include "../runtime/runtime.hpp"
 #include "decode_loop.hpp"
 #include "event_sink.hpp"
 #include "logprobs.hpp"
@@ -27,6 +30,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <optional>
 #include <random>
 #include <string>
 #include <thread>
@@ -116,6 +120,14 @@ struct DecodeResult {
      * prompt+tokens for the prefix cache when evicted_tokens > 0). */
     int                      evicted_tokens = 0;
     std::vector<llama_token> cache_tokens;
+
+    /* Cancelled before any token was generated. */
+    static DecodeResult cancelled_before_output() {
+        DecodeResult r;
+        r.finish_reason = "stop";
+        r.cancelled     = true;
+        return r;
+    }
 };
 
 /* Generation-time context shift (1.6). When enabled and the next KV cell
@@ -172,6 +184,281 @@ static void route_diffs(const std::vector<common_chat_msg_diff>& diffs,
     }
 }
 
+/* Per-choice output state shared by decode_one and decode_one_speculative:
+ * stop/length detection, logprobs, the reasoning extractor, tool-call
+ * parsing and streaming to the sink. The decoders only own KV and batch
+ * management.
+ *
+ * Each sampled token goes through append() (EOG / stop / length and logprob
+ * capture) and then emit() (release whatever became safe to stream). They
+ * are separate because decode_one feeds the token back into the KV between
+ * the two; push() runs both back to back for the speculative path. */
+class TokenEmitter {
+public:
+    TokenEmitter(Session& sess, EventSink& sink, int choice_index,
+                 const RenderResult& rendered, const LogprobsConfig& lp_cfg,
+                 const std::vector<std::string>& stops, int max_new_tokens,
+                 int stream_coalesce_ms, std::atomic<bool>& cancel_flag);
+
+    /* Appends `tk` to the output and records its logprob from `logits`
+     * (may be null). Returns true when generation stops at this token. */
+    bool append(llama_token tk, const float* logits);
+
+    /* Streams the bytes the last append() made safe to release. Returns true
+     * when the request was cancelled meanwhile (e.g. from the callback). */
+    bool emit();
+
+    bool push(llama_token tk, const float* logits) { return append(tk, logits) || emit(); }
+
+    void mark_cancelled() {
+        cancelled_     = true;
+        finish_reason_ = "stop";
+    }
+
+    /* Final parse / flush and the reasoning token count. */
+    DecodeResult finish();
+
+private:
+    llama_context*                  ctx_;
+    const llama_vocab*              vocab_;
+    EventSink&                      sink_;
+    const int                       choice_;
+    const LogprobsConfig&           lp_cfg_;
+    const std::vector<std::string>& stops_;
+    const int                       max_new_tokens_;
+    const int                       stream_coalesce_ms_;
+    std::atomic<bool>&              cancel_flag_;
+
+    bool                      has_parser_;
+    common_peg_arena          peg_arena_;
+    common_chat_parser_params pp_;
+    common_chat_msg           prev_parsed_;
+    int                       tool_calls_started_ = 0;
+
+    /* Splits the template's thinking block (default <think>...</think>) from
+     * regular content. thinking_forced_open: the prompt already opened the
+     * think block, so generation starts mid-thought (only the closing tag
+     * will appear). */
+    ReasoningExtractor reasoning_ex_;
+    std::string        reasoning_text_; /* re-tokenized in finish() for an
+                                         * accurate reasoning_tokens count */
+    int                lp_n_vocab_ = 0;
+
+    std::string                    output_;
+    std::string                    finish_reason_ = "stop";
+    int                            n_predicted_   = 0;
+    bool                           cancelled_     = false;
+    std::vector<llama_token>       gen_tokens_;
+    std::vector<TokenLogprobEntry> logprob_entries_;
+    std::vector<TokenLogprobEntry> lp_pending_; /* entries awaiting content release */
+    TokenLogprobEntry              last_lp_;
+    bool                           last_has_logits_ = false;
+
+    size_t emitted_up_to_ = 0; /* content-only path: bytes sent to sink */
+    size_t stop_scan_     = 0; /* incremental scan offset for check_stops */
+    std::chrono::steady_clock::time_point last_emit_ = std::chrono::steady_clock::now();
+
+    bool check_cancel() {
+        if (!cancel_flag_.load(std::memory_order_relaxed)) return false;
+        mark_cancelled();
+        return true;
+    }
+    void on_reasoning(const std::string& text) {
+        if (text.empty()) return;
+        sink_.on_reasoning_delta(choice_, text);
+        reasoning_text_ += text;
+    }
+    /* Queued logprob entries ride on the next content release, when allowed. */
+    void on_content(const std::string& content, bool with_logprobs) {
+        if (content.empty()) return;
+        if (with_logprobs && !lp_pending_.empty()) {
+            sink_.on_token_with_logprob(choice_, content, lp_pending_);
+            lp_pending_.clear();
+        } else {
+            sink_.on_content(choice_, content);
+        }
+    }
+    /* Pushes output_[emitted_up_to_, upto) through the reasoning extractor. */
+    void release(size_t upto, bool with_logprobs) {
+        auto rout = reasoning_ex_.push(std::string_view(output_.data() + emitted_up_to_,
+                                                        upto - emitted_up_to_));
+        on_reasoning(rout.reasoning);
+        on_content(rout.content, with_logprobs);
+        emitted_up_to_ = upto;
+    }
+};
+
+TokenEmitter::TokenEmitter(Session& sess, EventSink& sink, int choice_index,
+                           const RenderResult& rendered, const LogprobsConfig& lp_cfg,
+                           const std::vector<std::string>& stops, int max_new_tokens,
+                           int stream_coalesce_ms, std::atomic<bool>& cancel_flag)
+    : ctx_(sess.ctx())
+    , vocab_(llama_model_get_vocab(sess.model().llama_model_ptr()))
+    , sink_(sink)
+    , choice_(choice_index)
+    , lp_cfg_(lp_cfg)
+    , stops_(stops)
+    , max_new_tokens_(max_new_tokens)
+    , stream_coalesce_ms_(stream_coalesce_ms)
+    , cancel_flag_(cancel_flag)
+    , has_parser_(rendered.has_tools && !rendered.parser_data.empty())
+    , reasoning_ex_(rendered.extract_reasoning,
+                    rendered.thinking_forced_open,
+                    resolve_thinking_start_tag(rendered.thinking_start_tag,
+                                               rendered.thinking_end_tag),
+                    rendered.thinking_end_tag) {
+    if (has_parser_) {
+        try {
+            peg_arena_.load(rendered.parser_data);
+            pp_.format            = static_cast<common_chat_format>(rendered.chat_format);
+            pp_.generation_prompt = rendered.generation_prompt;
+            if (rendered.extract_reasoning)
+                pp_.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+        } catch (const std::exception& e) {
+            /* pp_ is only partially initialized here; clear the flag so no
+             * code path can pair has_parser_==true with an unusable parser. */
+            has_parser_ = false;
+            log_warn("PEG arena load failed, falling back to content-only: " +
+                     std::string(e.what()));
+        }
+    }
+    if (lp_cfg_.enabled) lp_n_vocab_ = llama_vocab_n_tokens(vocab_);
+}
+
+bool TokenEmitter::append(llama_token tk, const float* logits) {
+    if (llama_vocab_is_eog(vocab_, tk)) {
+        finish_reason_ = "stop";
+        return true;
+    }
+    output_ += common_token_to_piece(ctx_, tk, /*special=*/false);
+    gen_tokens_.push_back(tk);
+    ++n_predicted_;
+
+    last_has_logits_ = lp_cfg_.enabled && logits;
+    last_lp_         = TokenLogprobEntry{};
+    if (last_has_logits_) {
+        last_lp_ = compute_logprob_entry(logits, lp_n_vocab_, tk, ctx_,
+                                         lp_cfg_.temperature, lp_cfg_.top_n);
+        logprob_entries_.push_back(last_lp_);
+    }
+
+    /* Stop strings are checked against the raw output on every path; for
+     * tool-aware paths the grammar keeps the output well-formed, so template
+     * stops fire at the right place (EOS / end-of-turn tokens). */
+    const size_t safe     = valid_utf8_prefix_len(output_.data(), output_.size());
+    const size_t stop_pos = check_stops(output_, safe, stops_, &stop_scan_);
+    if (stop_pos != std::string::npos) {
+        output_.resize(stop_pos);
+        finish_reason_ = "stop";
+        return true;
+    }
+    if (n_predicted_ >= max_new_tokens_) {
+        finish_reason_ = "length";
+        return true;
+    }
+    return false;
+}
+
+bool TokenEmitter::emit() {
+    /* Both paths hold back any output suffix that is a prefix of a stop
+     * string — a stop match can span token boundaries, and once bytes reach
+     * the sink they cannot be retracted. Held-back bytes that never complete
+     * a stop are released on a later token or the final flush. */
+    const size_t new_safe = valid_utf8_prefix_len(output_.data(), output_.size());
+    const size_t emit_len = new_safe - partial_stop_len(output_, new_safe, stops_);
+
+    if (lp_cfg_.enabled && !has_parser_ && last_has_logits_) {
+        /* Per-token emission (logprobs on the content-only path). Every entry
+         * accrued since the last release rides on whatever content the
+         * extractor releases now; entries are queued rather than dropped
+         * because the extractor's partial-tag lookahead (and stop-string
+         * holdback) can withhold a token's bytes until a later step — or
+         * until the final flush. */
+        lp_pending_.push_back(last_lp_);
+        if (emit_len > emitted_up_to_) release(emit_len, /*with_logprobs=*/true);
+        last_emit_ = std::chrono::steady_clock::now();
+        return check_cancel();
+    }
+
+    /* Coalesced emission. */
+    if (emit_len <= (has_parser_ ? 0 : emitted_up_to_)) return false;
+    if (stream_coalesce_ms_ > 0) {
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - last_emit_).count();
+        if (ms < stream_coalesce_ms_) return false;
+    }
+    if (has_parser_ && !peg_arena_.empty()) {
+        try {
+            common_chat_msg current = common_chat_peg_parse(
+                peg_arena_, output_.substr(0, emit_len), /*is_partial=*/true, pp_);
+            auto diffs = common_chat_msg_diff::compute_diffs(prev_parsed_, current);
+            route_diffs(diffs, sink_, choice_, tool_calls_started_, &reasoning_text_);
+            prev_parsed_ = std::move(current);
+        } catch (const std::exception& e) {
+            log_warn("PEG parse error during streaming: " + std::string(e.what()));
+        }
+    } else {
+        release(emit_len, /*with_logprobs=*/false);
+    }
+    last_emit_ = std::chrono::steady_clock::now();
+    return check_cancel();
+}
+
+DecodeResult TokenEmitter::finish() {
+    if (has_parser_ && !peg_arena_.empty() && !cancelled_) {
+        /* Final parse (non-partial): extracts complete tool calls and remaining content. */
+        try {
+            common_chat_msg final_msg = common_chat_peg_parse(
+                peg_arena_, output_, /*is_partial=*/false, pp_);
+            auto diffs = common_chat_msg_diff::compute_diffs(prev_parsed_, final_msg);
+            route_diffs(diffs, sink_, choice_, tool_calls_started_, &reasoning_text_);
+
+            if (tool_calls_started_ > 0) {
+                sink_.on_tool_call_end(choice_, tool_calls_started_ - 1);
+                finish_reason_ = "tool_calls";
+            }
+        } catch (const std::exception& e) {
+            log_warn("PEG final parse error: " + std::string(e.what()));
+            /* Fall through with whatever content the sink already received. */
+        }
+    } else if (!has_parser_) {
+        /* Content-only: push the remaining safe bytes through the reasoning
+         * extractor, then flush its lookahead buffer (partial tag text).
+         * Queued logprob entries ride on the first content release so short
+         * generations (fully held back by the lookahead) still deliver their
+         * logprobs. */
+        const size_t final_safe = valid_utf8_prefix_len(output_.data(), output_.size());
+        if (final_safe > emitted_up_to_) release(final_safe, /*with_logprobs=*/true);
+        auto flush_rout = reasoning_ex_.flush();
+        on_reasoning(flush_rout.reasoning);
+        on_content(flush_rout.content, /*with_logprobs=*/true);
+
+        if (!reasoning_text_.empty()) sink_.on_reasoning_end(choice_);
+    }
+    /* Note: if cancelled with a parser, the final parse is skipped — any
+     * pending tool call (started but not ended) is dropped, and finish_reason
+     * stays "stop". */
+
+    DecodeResult r;
+    /* Reasoning token count: re-tokenize the extracted reasoning text with the
+     * model's own tokenizer so the count is BPE-accurate (matching how usage
+     * is reported by OpenAI), rather than a chars/4 heuristic. add_special and
+     * parse_special are false: the reasoning text carries no BOS and the
+     * thinking tags have already been stripped by the extractor. */
+    if (!reasoning_text_.empty()) {
+        r.reasoning_tokens = static_cast<int>(
+            common_tokenize(ctx_, reasoning_text_, /*add_special=*/false,
+                            /*parse_special=*/false).size());
+    }
+    r.content       = std::move(output_);
+    r.finish_reason = finish_reason_;
+    r.n_predicted   = n_predicted_;
+    r.cancelled     = cancelled_;
+    r.tokens        = std::move(gen_tokens_);
+    r.logprobs      = std::move(logprob_entries_);
+    return r;
+}
+
 static DecodeResult decode_one(Session& sess,
                                 const std::vector<llama_token>& prompt_tokens,
                                 int max_new_tokens,
@@ -203,66 +490,35 @@ static DecodeResult decode_one(Session& sess,
 
         /* ---- Cancel check before heavy work ---- */
         if (cancel_flag.load(std::memory_order_relaxed)) {
-            return {"", "stop", 0, 0, true, {}};
+            return DecodeResult::cancelled_before_output();
         }
 
         /* ---- Prefill ---- */
         for (int i = static_cast<int>(lcp); i < n_prompt; i += n_batch) {
             if (cancel_flag.load(std::memory_order_relaxed)) {
-                return {"", "stop", 0, 0, true, {}};
+                return DecodeResult::cancelled_before_output();
             }
             int chunk_size = std::min(n_batch, n_prompt - i);
             llama_batch batch = llama_batch_get_one(
                 const_cast<llama_token*>(prompt_tokens.data()) + i, chunk_size);
             if (llama_decode(ctx, batch) != 0) {
-                throw Error(HELIX_E_BACKEND, "llama_decode failed during prefill",
-                            "backend_error", "", "helix_e_backend");
+                throw_backend("llama_decode failed during prefill");
             }
         }
     } else {
         /* Multimodal path: prefill was done externally by eval_media. */
         if (cancel_flag.load(std::memory_order_relaxed)) {
-            return {"", "stop", 0, 0, true, {}};
+            return DecodeResult::cancelled_before_output();
         }
     }
 
     sink.on_role(choice_index);
     if (cancel_flag.load(std::memory_order_relaxed)) {
-        return {"", "stop", 0, 0, true, {}};
+        return DecodeResult::cancelled_before_output();
     }
 
-    /* ---- Set up PEG parser when tools are active ---- */
-    bool has_parser = rendered.has_tools && !rendered.parser_data.empty();
-    common_peg_arena peg_arena;
-    common_chat_parser_params pp;
-    common_chat_msg prev_parsed;
-    if (has_parser) {
-        try {
-            peg_arena.load(rendered.parser_data);
-            pp.format             = static_cast<common_chat_format>(rendered.chat_format);
-            pp.generation_prompt  = rendered.generation_prompt;
-            if (rendered.extract_reasoning)
-                pp.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
-        } catch (const std::exception& e) {
-            /* pp is only partially initialized here; clear the flag so no
-             * code path can pair has_parser==true with an unusable parser. */
-            has_parser = false;
-            log_warn("PEG arena load failed, falling back to content-only: " +
-                     std::string(e.what()));
-        }
-    }
-
-    /* ---- Decode loop ---- */
-    std::string output;
-    std::string finish_reason = "stop";
-    int n_predicted = 0;
-    std::string reasoning_text; /* accumulated reasoning content (re-tokenized for an
-                                 * accurate reasoning_tokens count at end of decode) */
-    bool cancelled = false;
-    std::vector<llama_token> gen_tokens;
-    std::vector<TokenLogprobEntry> logprob_entries;
-    std::vector<TokenLogprobEntry> lp_pending; /* entries awaiting content release */
-    int tool_calls_started = 0;
+    TokenEmitter emitter(sess, sink, choice_index, rendered, lp_cfg, stops,
+                         max_new_tokens, stream_coalesce_ms, cancel_flag);
 
     /* Whether this call is operating on a multimodal-prefilled context.
      * n_past_mm == -1 is the sentinel for "text-only"; any non-negative value
@@ -283,22 +539,6 @@ static DecodeResult decode_one(Session& sess,
     llama_batch& mm_batch  = mm_guard.b;
     llama_pos    mm_n_past = n_past_mm;
 
-    /* Reasoning extractor: splits <think>...</think> from regular content.
-     * thinking_forced_open: the prompt already opened the think block, so
-     * generation starts mid-thought (only the closing tag will appear). */
-    ReasoningExtractor reasoning_ex(rendered.extract_reasoning,
-                                    rendered.thinking_forced_open);
-
-    // For logprob capture we need vocab + n_vocab.
-    const llama_vocab* lp_vocab =
-        lp_cfg.enabled ? llama_model_get_vocab(sess.model().llama_model_ptr()) : nullptr;
-    const int lp_n_vocab = lp_vocab ? llama_vocab_n_tokens(lp_vocab) : 0;
-
-    size_t emitted_up_to = 0; /* content-only path: bytes sent to sink */
-    size_t stop_scan     = 0; /* incremental scan offset for check_stops */
-    auto last_emit = std::chrono::steady_clock::now();
-    const llama_vocab* vocab = llama_model_get_vocab(sess.model().llama_model_ptr());
-
     /* 1.6 context-shift state. n_past mirrors the KV cell count of seq 0
      * (prompt + fed-back tokens); cache_tokens mirrors the cell CONTENT so
      * the prefix-cache invariant (last_tokens_ == KV seq 0) survives
@@ -311,8 +551,7 @@ static DecodeResult decode_one(Session& sess,
 
     for (;;) {
         if (cancel_flag.load(std::memory_order_relaxed)) {
-            cancelled = true;
-            finish_reason = "stop";
+            emitter.mark_cancelled();
             break;
         }
 
@@ -328,40 +567,7 @@ static DecodeResult decode_one(Session& sess,
          * grammar state machine and cause "empty grammar stack" errors. */
         llama_token new_token = llama_sampler_sample(sampler, ctx, -1);
 
-        if (llama_vocab_is_eog(vocab, new_token)) {
-            finish_reason = "stop";
-            break;
-        }
-
-        std::string piece = common_token_to_piece(ctx, new_token, /*special=*/false);
-        output += piece;
-        gen_tokens.push_back(new_token);
-        ++n_predicted;
-
-        // Compute logprob entry for this token (phase 6).
-        TokenLogprobEntry lp_entry;
-        if (lp_cfg.enabled && lp_raw) {
-            lp_entry = compute_logprob_entry(lp_raw, lp_n_vocab, new_token, ctx,
-                                              lp_cfg.temperature, lp_cfg.top_n);
-            logprob_entries.push_back(lp_entry);
-        }
-
-        /* Stop-string check (content-only path: against raw output).
-         * For tool-aware paths, stop strings are checked against raw output too —
-         * the grammar constraint keeps well-formed output so template stops fire
-         * at the right place (EOS / end-of-turn tokens). */
-        size_t safe = valid_utf8_prefix_len(output.data(), output.size());
-        size_t stop_pos = check_stops(output, safe, stops, &stop_scan);
-        if (stop_pos != std::string::npos) {
-            output.resize(stop_pos);
-            finish_reason = "stop";
-            break;
-        }
-
-        if (n_predicted >= max_new_tokens) {
-            finish_reason = "length";
-            break;
-        }
+        if (emitter.append(new_token, lp_raw)) break;
 
         /* Context shift (1.6): the next decode writes KV cell n_past; when
          * that would exceed the context, evict the oldest block after the
@@ -392,167 +598,18 @@ static DecodeResult decode_one(Session& sess,
             next_batch = llama_batch_get_one(&new_token, 1);
         }
         if (llama_decode(ctx, next_batch) != 0) {
-            throw Error(HELIX_E_BACKEND, "llama_decode failed during generation",
-                        "backend_error", "", "helix_e_backend");
+            throw_backend("llama_decode failed during generation");
         }
         ++n_past;
         if (shift.enabled) cache_tokens.push_back(new_token);
 
-        /* Content emission: per-token with logprobs, or coalesced without.
-         * Both paths hold back any output suffix that is a prefix of a stop
-         * string — a stop match can span token boundaries, and once bytes
-         * reach the sink they cannot be retracted. Held-back bytes that never
-         * complete a stop are released on a later token or the final flush. */
-        if (lp_cfg.enabled && !has_parser && lp_raw) {
-            /* Per-token emission path (logprobs active on content-only path).
-             * Route the newly emittable bytes through the reasoning extractor
-             * and attach every logprob entry accrued since the last release to
-             * whatever content the extractor releases this step. Entries are
-             * queued rather than dropped because the extractor's partial-tag
-             * lookahead (and stop-string holdback) can withhold a token's
-             * bytes until a later step — or until the final flush. */
-            lp_pending.push_back(lp_entry);
-            size_t new_safe = valid_utf8_prefix_len(output.data(), output.size());
-            size_t emit_len = new_safe - partial_stop_len(output, new_safe, stops);
-            if (emit_len > emitted_up_to) {
-                auto delta = std::string_view(output.data() + emitted_up_to,
-                                              emit_len - emitted_up_to);
-                auto rout = reasoning_ex.push(delta);
-                if (!rout.reasoning.empty()) {
-                    sink.on_reasoning_delta(choice_index, rout.reasoning);
-                    reasoning_text += rout.reasoning;
-                }
-                if (!rout.content.empty()) {
-                    sink.on_token_with_logprob(choice_index, rout.content, lp_pending);
-                    lp_pending.clear();
-                }
-                emitted_up_to = emit_len;
-            }
-            last_emit = std::chrono::steady_clock::now();
-            if (cancel_flag.load(std::memory_order_relaxed)) {
-                cancelled = true;
-                finish_reason = "stop";
-                break;
-            }
-        } else {
-            /* Coalesced content emission. */
-            size_t new_safe = valid_utf8_prefix_len(output.data(), output.size());
-            size_t emit_len = new_safe - partial_stop_len(output, new_safe, stops);
-            if (emit_len > (has_parser ? 0 : emitted_up_to)) {
-                bool should_emit = (stream_coalesce_ms <= 0);
-                if (!should_emit) {
-                    auto now_tp = std::chrono::steady_clock::now();
-                    long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        now_tp - last_emit).count();
-                    should_emit = (ms >= stream_coalesce_ms);
-                }
-                if (should_emit) {
-                    if (has_parser && !peg_arena.empty()) {
-                        try {
-                            common_chat_msg current = common_chat_peg_parse(
-                                peg_arena, output.substr(0, emit_len),
-                                /*is_partial=*/true, pp);
-                            auto diffs = common_chat_msg_diff::compute_diffs(prev_parsed, current);
-                            route_diffs(diffs, sink, choice_index, tool_calls_started,
-                                        &reasoning_text);
-                            prev_parsed = std::move(current);
-                        } catch (const std::exception& e) {
-                            log_warn("PEG parse error during streaming: " + std::string(e.what()));
-                        }
-                    } else {
-                        auto delta = std::string_view(output.data() + emitted_up_to,
-                                                      emit_len - emitted_up_to);
-                        auto rout = reasoning_ex.push(delta);
-                        if (!rout.reasoning.empty()) {
-                            sink.on_reasoning_delta(choice_index, rout.reasoning);
-                            reasoning_text += rout.reasoning;
-                        }
-                        if (!rout.content.empty()) {
-                            sink.on_content(choice_index, rout.content);
-                        }
-                        emitted_up_to = emit_len;
-                    }
-                    last_emit = std::chrono::steady_clock::now();
-                    if (cancel_flag.load(std::memory_order_relaxed)) {
-                        cancelled = true;
-                        finish_reason = "stop";
-                        break;
-                    }
-                }
-            }
-        }
+        if (emitter.emit()) break;
     }
 
-    /* ---- Final flush ---- */
-    if (has_parser && !peg_arena.empty() && !cancelled) {
-        /* Final parse (non-partial): extracts complete tool calls and remaining content. */
-        try {
-            common_chat_msg final_msg = common_chat_peg_parse(
-                peg_arena, output, /*is_partial=*/false, pp);
-            auto diffs = common_chat_msg_diff::compute_diffs(prev_parsed, final_msg);
-            route_diffs(diffs, sink, choice_index, tool_calls_started, &reasoning_text);
-
-            if (tool_calls_started > 0) {
-                sink.on_tool_call_end(choice_index, tool_calls_started - 1);
-                finish_reason = "tool_calls";
-            }
-        } catch (const std::exception& e) {
-            log_warn("PEG final parse error: " + std::string(e.what()));
-            /* Fall through with whatever content the sink already received. */
-        }
-    } else if (!has_parser) {
-        /* Content-only: push remaining safe bytes through reasoning extractor,
-         * then flush. Queued logprob entries ride on the first content release
-         * so short generations (fully held back by the extractor's lookahead)
-         * still deliver their logprobs. */
-        auto emit_content = [&](const std::string& content) {
-            if (content.empty()) return;
-            if (!lp_pending.empty()) {
-                sink.on_token_with_logprob(choice_index, content, lp_pending);
-                lp_pending.clear();
-            } else {
-                sink.on_content(choice_index, content);
-            }
-        };
-        size_t final_safe = valid_utf8_prefix_len(output.data(), output.size());
-        if (final_safe > emitted_up_to) {
-            auto delta = std::string_view(output.data() + emitted_up_to,
-                                           final_safe - emitted_up_to);
-            auto rout = reasoning_ex.push(delta);
-            if (!rout.reasoning.empty()) {
-                sink.on_reasoning_delta(choice_index, rout.reasoning);
-                reasoning_text += rout.reasoning;
-            }
-            emit_content(rout.content);
-        }
-        /* Flush the lookahead buffer (partial tag text). */
-        auto flush_rout = reasoning_ex.flush();
-        if (!flush_rout.reasoning.empty()) {
-            sink.on_reasoning_delta(choice_index, flush_rout.reasoning);
-            reasoning_text += flush_rout.reasoning;
-        }
-        emit_content(flush_rout.content);
-
-        if (!reasoning_text.empty()) sink.on_reasoning_end(choice_index);
-    }
-    /* Note: if cancelled and has_parser, we skip the final parse — any pending
-     * tool call (started but not ended) is dropped, and finish_reason stays "stop". */
-
-    /* Reasoning token count: re-tokenize the extracted reasoning text with the
-     * model's own tokenizer so the count is BPE-accurate (matching how usage
-     * is reported by OpenAI), rather than a chars/4 heuristic. add_special and
-     * parse_special are false: the reasoning text carries no BOS and the
-     * <think>/</think> markers have already been stripped by the extractor. */
-    int reasoning_tokens = 0;
-    if (!reasoning_text.empty()) {
-        reasoning_tokens = static_cast<int>(
-            common_tokenize(ctx, reasoning_text, /*add_special=*/false,
-                            /*parse_special=*/false).size());
-    }
-
-    return {std::move(output), finish_reason, n_predicted, reasoning_tokens, cancelled,
-            std::move(gen_tokens), std::move(logprob_entries),
-            evicted_total, std::move(cache_tokens)};
+    DecodeResult result  = emitter.finish();
+    result.evicted_tokens = evicted_total;
+    result.cache_tokens   = std::move(cache_tokens);
+    return result;
 }
 
 /* ------------------------------------------------------------------ */
@@ -574,7 +631,6 @@ static DecodeResult decode_one_speculative(Session& sess,
     common_speculative* spec = sess.spec_mtp();
     const int n_prompt = static_cast<int>(prompt_tokens.size());
     const int n_batch  = llama_n_batch(ctx);
-    const llama_vocab* vocab = llama_model_get_vocab(sess.model().llama_model_ptr());
 
     /* ---- Prefill (text-only; the speculative path is never used for
      * multimodal — run_chat_completions falls back to decode_one). ---- */
@@ -583,11 +639,11 @@ static DecodeResult decode_one_speculative(Session& sess,
         llama_memory_seq_rm(mem, 0, 0, -1);
     }
     if (cancel_flag.load(std::memory_order_relaxed))
-        return {"", "stop", 0, 0, true, {}};
+        return DecodeResult::cancelled_before_output();
 
     for (int i = 0; i < n_prompt; i += n_batch) {
         if (cancel_flag.load(std::memory_order_relaxed))
-            return {"", "stop", 0, 0, true, {}};
+            return DecodeResult::cancelled_before_output();
         int chunk_size = std::min(n_batch, n_prompt - i);
         /* Use common_batch_add (sets seq_id) rather than llama_batch_get_one,
          * because common_speculative_process reads seq_id arrays per token. */
@@ -602,172 +658,23 @@ static DecodeResult decode_one_speculative(Session& sess,
         }
         if (llama_decode(ctx, pbatch) != 0) {
             llama_batch_free(pbatch);
-            throw Error(HELIX_E_BACKEND, "llama_decode failed during prefill",
-                        "backend_error", "", "helix_e_backend");
+            throw_backend("llama_decode failed during prefill");
         }
         /* Mirror the prefill chunk into the MTP draft context so its KV
          * state matches the target before drafting begins. */
         if (!common_speculative_process(spec, pbatch)) {
             llama_batch_free(pbatch);
-            throw Error(HELIX_E_BACKEND,
-                        "common_speculative_process failed during prefill",
-                        "backend_error", "", "helix_e_backend");
+            throw_backend("common_speculative_process failed during prefill");
         }
         llama_batch_free(pbatch);
     }
 
     sink.on_role(choice_index);
     if (cancel_flag.load(std::memory_order_relaxed))
-        return {"", "stop", 0, 0, true, {}};
+        return DecodeResult::cancelled_before_output();
 
-    /* ---- PEG parser setup (same as decode_one) ---- */
-    bool has_parser = rendered.has_tools && !rendered.parser_data.empty();
-    common_peg_arena peg_arena;
-    common_chat_parser_params pp;
-    common_chat_msg prev_parsed;
-    if (has_parser) {
-        try {
-            peg_arena.load(rendered.parser_data);
-            pp.format            = static_cast<common_chat_format>(rendered.chat_format);
-            pp.generation_prompt = rendered.generation_prompt;
-            if (rendered.extract_reasoning)
-                pp.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
-        } catch (const std::exception& e) {
-            has_parser = false;
-            log_warn("PEG arena load failed, falling back to content-only: " +
-                     std::string(e.what()));
-        }
-    }
-
-    /* ---- Decode state (mirrors decode_one) ---- */
-    std::string output;
-    std::string finish_reason = "stop";
-    int n_predicted = 0;
-    std::string reasoning_text;
-    bool cancelled = false;
-    std::vector<llama_token> gen_tokens;
-    std::vector<TokenLogprobEntry> logprob_entries;
-    std::vector<TokenLogprobEntry> lp_pending; /* entries awaiting content release */
-    int tool_calls_started = 0;
-
-    ReasoningExtractor reasoning_ex(rendered.extract_reasoning,
-                                    rendered.thinking_forced_open);
-
-    const llama_vocab* lp_vocab =
-        lp_cfg.enabled ? llama_model_get_vocab(sess.model().llama_model_ptr()) : nullptr;
-    const int lp_n_vocab = lp_vocab ? llama_vocab_n_tokens(lp_vocab) : 0;
-
-    size_t emitted_up_to = 0;
-    size_t stop_scan     = 0; /* incremental scan offset for check_stops */
-    auto last_emit = std::chrono::steady_clock::now();
-
-    /* ---- Shared per-token emission helper ----
-     * Processes one token through EOG/stop/length/emission, appending to
-     * output and driving the sink. Returns true if generation should stop. */
-    auto emit_one = [&](llama_token tk, const float* tk_logits) -> bool {
-        if (llama_vocab_is_eog(vocab, tk)) {
-            finish_reason = "stop";
-            return true;
-        }
-        std::string piece = common_token_to_piece(ctx, tk, /*special=*/false);
-        output += piece;
-        gen_tokens.push_back(tk);
-        ++n_predicted;
-
-        TokenLogprobEntry lp_entry;
-        if (lp_cfg.enabled && tk_logits) {
-            lp_entry = compute_logprob_entry(tk_logits, lp_n_vocab, tk, ctx,
-                                              lp_cfg.temperature, lp_cfg.top_n);
-            logprob_entries.push_back(lp_entry);
-        }
-
-        size_t safe = valid_utf8_prefix_len(output.data(), output.size());
-        size_t stop_pos = check_stops(output, safe, stops, &stop_scan);
-        if (stop_pos != std::string::npos) {
-            output.resize(stop_pos);
-            finish_reason = "stop";
-            return true;
-        }
-        if (n_predicted >= max_new_tokens) {
-            finish_reason = "length";
-            return true;
-        }
-
-        /* Content emission: per-token with logprobs, or coalesced. Both paths
-         * hold back any output suffix that is a prefix of a stop string —
-         * see decode_one for the rationale. */
-        if (lp_cfg.enabled && !has_parser && tk_logits) {
-            /* Queue entries across withheld steps — see decode_one. */
-            lp_pending.push_back(lp_entry);
-            size_t new_safe = valid_utf8_prefix_len(output.data(), output.size());
-            size_t emit_len = new_safe - partial_stop_len(output, new_safe, stops);
-            if (emit_len > emitted_up_to) {
-                auto delta = std::string_view(output.data() + emitted_up_to,
-                                              emit_len - emitted_up_to);
-                auto rout = reasoning_ex.push(delta);
-                if (!rout.reasoning.empty()) {
-                    sink.on_reasoning_delta(choice_index, rout.reasoning);
-                    reasoning_text += rout.reasoning;
-                }
-                if (!rout.content.empty()) {
-                    sink.on_token_with_logprob(choice_index, rout.content, lp_pending);
-                    lp_pending.clear();
-                }
-                emitted_up_to = emit_len;
-            }
-            last_emit = std::chrono::steady_clock::now();
-            if (cancel_flag.load(std::memory_order_relaxed)) {
-                cancelled = true;
-                finish_reason = "stop";
-                return true;
-            }
-        } else {
-            size_t new_safe = valid_utf8_prefix_len(output.data(), output.size());
-            size_t emit_len = new_safe - partial_stop_len(output, new_safe, stops);
-            if (emit_len > (has_parser ? 0 : emitted_up_to)) {
-                bool should_emit = (stream_coalesce_ms <= 0);
-                if (!should_emit) {
-                    auto now_tp = std::chrono::steady_clock::now();
-                    long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        now_tp - last_emit).count();
-                    should_emit = (ms >= stream_coalesce_ms);
-                }
-                if (should_emit) {
-                    if (has_parser && !peg_arena.empty()) {
-                        try {
-                            common_chat_msg current = common_chat_peg_parse(
-                                peg_arena, output.substr(0, emit_len),
-                                /*is_partial=*/true, pp);
-                            auto diffs = common_chat_msg_diff::compute_diffs(prev_parsed, current);
-                            route_diffs(diffs, sink, choice_index, tool_calls_started,
-                                        &reasoning_text);
-                            prev_parsed = std::move(current);
-                        } catch (const std::exception& e) {
-                            log_warn("PEG parse error during streaming: " + std::string(e.what()));
-                        }
-                    } else {
-                        auto delta = std::string_view(output.data() + emitted_up_to,
-                                                       emit_len - emitted_up_to);
-                        auto rout = reasoning_ex.push(delta);
-                        if (!rout.reasoning.empty()) {
-                            sink.on_reasoning_delta(choice_index, rout.reasoning);
-                            reasoning_text += rout.reasoning;
-                        }
-                        if (!rout.content.empty())
-                            sink.on_content(choice_index, rout.content);
-                        emitted_up_to = emit_len;
-                    }
-                    last_emit = std::chrono::steady_clock::now();
-                    if (cancel_flag.load(std::memory_order_relaxed)) {
-                        cancelled = true;
-                        finish_reason = "stop";
-                        return true;
-                    }
-                }
-            }
-        }
-        return false;
-    };
+    TokenEmitter emitter(sess, sink, choice_index, rendered, lp_cfg, stops,
+                         max_new_tokens, stream_coalesce_ms, cancel_flag);
 
     /* ---- common_speculative_begin: notify the manager that prefill is done */
     common_speculative_begin(spec, /*seq_id=*/0, prompt_tokens);
@@ -777,167 +684,126 @@ static DecodeResult decode_one_speculative(Session& sess,
     llama_token id_last = llama_sampler_sample(sampler, ctx, -1);
     llama_pos   n_past  = static_cast<llama_pos>(n_prompt);
 
-    if (emit_one(id_last, lp_raw_first)) goto spec_done;
+    if (emitter.push(id_last, lp_raw_first)) return emitter.finish();
 
     /* ---- Speculative decode loop ---- */
-    {
-        llama_batch sbatch = llama_batch_init(n_batch, /*embd=*/ 0, /*n_seq_max=*/ 1);
-        struct SBatchGuard { llama_batch b; ~SBatchGuard(){ llama_batch_free(b); } } sguard{sbatch};
+    llama_batch sbatch = llama_batch_init(n_batch, /*embd=*/ 0, /*n_seq_max=*/ 1);
+    struct SBatchGuard { llama_batch b; ~SBatchGuard(){ llama_batch_free(b); } } sguard{sbatch};
 
-        for (;;) {
-            if (cancel_flag.load(std::memory_order_relaxed)) {
-                cancelled = true;
-                finish_reason = "stop";
-                break;
-            }
-
-            /* 1. Request a draft. */
-            std::vector<llama_token> draft;
-            common_speculative_get_draft_params(spec, /*seq_id=*/0) = {
-                /*drafting=*/true,
-                /*n_max=*/   -1,                 /* impl clamps to remaining ctx */
-                /*n_past=*/  n_past,
-                /*id_last=*/ id_last,
-                /*prompt=*/  &prompt_tokens,
-                /*result=*/  &draft,
-            };
-            common_speculative_draft(spec);
-
-            /* If no draft (e.g. context exhausted), fall back to a plain
-             * single-token decode to make progress. Build the batch with
-             * common_batch_add — common_speculative_process reads per-token
-             * seq_id arrays, which llama_batch_get_one leaves null. */
-            if (draft.empty()) {
-                common_batch_clear(sbatch);
-                common_batch_add(sbatch, id_last, n_past, {0}, /*logits=*/true);
-                if (llama_decode(ctx, sbatch) != 0)
-                    throw Error(HELIX_E_BACKEND, "llama_decode failed during MTP fallback",
-                                "backend_error", "", "helix_e_backend");
-                if (!common_speculative_process(spec, sbatch))
-                    throw Error(HELIX_E_BACKEND,
-                                "common_speculative_process failed during MTP fallback",
-                                "backend_error", "", "helix_e_backend");
-                llama_token next = llama_sampler_sample(sampler, ctx, -1);
-                llama_memory_seq_rm(llama_get_memory(ctx), 0, n_past + 1, -1);
-                common_speculative_accept(spec, 0, 0);
-                if (emit_one(next, lp_cfg.enabled ? llama_get_logits_ith(ctx, 0) : nullptr))
-                    break;
-                n_past += 1;
-                id_last = next;
-                continue;
-            }
-
-            /* 2. Build target batch: [id_last, draft0, ..., draftN-1]. */
-            std::vector<int> spec_i_batch;
-            spec_i_batch.reserve(draft.size() + 1);
-            common_batch_clear(sbatch);
-            spec_i_batch.push_back(sbatch.n_tokens);
-            common_batch_add(sbatch, id_last, n_past, {0}, /*logits=*/true);
-            for (size_t i = 0; i < draft.size(); ++i) {
-                spec_i_batch.push_back(sbatch.n_tokens);
-                common_batch_add(sbatch, draft[i],
-                                 n_past + static_cast<llama_pos>(i) + 1, {0}, /*logits=*/true);
-            }
-
-            /* 3. Target decode. */
-            if (llama_decode(ctx, sbatch) != 0)
-                throw Error(HELIX_E_BACKEND, "llama_decode failed during MTP generation",
-                            "backend_error", "", "helix_e_backend");
-
-            /* 4. Mirror target hidden states into the draft context. */
-            if (!common_speculative_process(spec, sbatch))
-                throw Error(HELIX_E_BACKEND,
-                            "common_speculative_process failed",
-                            "backend_error", "", "helix_e_backend");
-
-            /* 5. Verify draft against the target via the raw sampler chain. */
-            auto accepted = helix_sample_and_accept_n(sampler, ctx, spec_i_batch, draft);
-
-            /* 6. KV cleanup: remove rejected draft positions. The last accepted
-             *    token is only sampled (not decoded) so it stays out of the KV
-             *    and becomes id_last for the next iteration. */
-            llama_memory_seq_rm(llama_get_memory(ctx), 0,
-                                n_past + static_cast<llama_pos>(accepted.size()), -1);
-
-            /* 7. Inform the manager how many drafts were accepted. */
-            common_speculative_accept(spec, /*seq_id=*/0,
-                                      static_cast<uint16_t>(accepted.size() - 1));
-
-            /* 8. Emit each accepted token through the shared emission helper. */
-            bool loop_broke = false;
-            for (size_t i = 0; i < accepted.size(); ++i) {
-                const float* tk_logits = lp_cfg.enabled
-                    ? llama_get_logits_ith(ctx, spec_i_batch[i]) : nullptr;
-                if (emit_one(accepted[i], tk_logits)) {
-                    loop_broke = true;
-                    break;
-                }
-            }
-            if (loop_broke) break;
-
-            /* 9. Advance. */
-            n_past  += static_cast<llama_pos>(accepted.size());
-            id_last  = accepted.back();
+    for (;;) {
+        if (cancel_flag.load(std::memory_order_relaxed)) {
+            emitter.mark_cancelled();
+            break;
         }
-    }
 
-spec_done:
-    /* ---- Final flush (same as decode_one) ---- */
-    if (has_parser && !peg_arena.empty() && !cancelled) {
-        try {
-            common_chat_msg final_msg = common_chat_peg_parse(
-                peg_arena, output, /*is_partial=*/false, pp);
-            auto diffs = common_chat_msg_diff::compute_diffs(prev_parsed, final_msg);
-            route_diffs(diffs, sink, choice_index, tool_calls_started, &reasoning_text);
-            if (tool_calls_started > 0) {
-                sink.on_tool_call_end(choice_index, tool_calls_started - 1);
-                finish_reason = "tool_calls";
-            }
-        } catch (const std::exception& e) {
-            log_warn("PEG final parse error: " + std::string(e.what()));
-        }
-    } else if (!has_parser) {
-        /* Queued logprob entries ride on the first content release — see decode_one. */
-        auto emit_content = [&](const std::string& content) {
-            if (content.empty()) return;
-            if (!lp_pending.empty()) {
-                sink.on_token_with_logprob(choice_index, content, lp_pending);
-                lp_pending.clear();
-            } else {
-                sink.on_content(choice_index, content);
-            }
+        /* 1. Request a draft. */
+        std::vector<llama_token> draft;
+        common_speculative_get_draft_params(spec, /*seq_id=*/0) = {
+            /*drafting=*/true,
+            /*n_max=*/   -1,                 /* impl clamps to remaining ctx */
+            /*n_past=*/  n_past,
+            /*id_last=*/ id_last,
+            /*prompt=*/  &prompt_tokens,
+            /*result=*/  &draft,
         };
-        size_t final_safe = valid_utf8_prefix_len(output.data(), output.size());
-        if (final_safe > emitted_up_to) {
-            auto delta = std::string_view(output.data() + emitted_up_to,
-                                           final_safe - emitted_up_to);
-            auto rout = reasoning_ex.push(delta);
-            if (!rout.reasoning.empty()) {
-                sink.on_reasoning_delta(choice_index, rout.reasoning);
-                reasoning_text += rout.reasoning;
-            }
-            emit_content(rout.content);
+        common_speculative_draft(spec);
+
+        /* If no draft (e.g. context exhausted), fall back to a plain
+         * single-token decode to make progress. Build the batch with
+         * common_batch_add — common_speculative_process reads per-token
+         * seq_id arrays, which llama_batch_get_one leaves null. */
+        if (draft.empty()) {
+            common_batch_clear(sbatch);
+            common_batch_add(sbatch, id_last, n_past, {0}, /*logits=*/true);
+            if (llama_decode(ctx, sbatch) != 0)
+                throw_backend("llama_decode failed during MTP fallback");
+            if (!common_speculative_process(spec, sbatch))
+                throw_backend("common_speculative_process failed during MTP fallback");
+            llama_token next = llama_sampler_sample(sampler, ctx, -1);
+            llama_memory_seq_rm(llama_get_memory(ctx), 0, n_past + 1, -1);
+            common_speculative_accept(spec, 0, 0);
+            if (emitter.push(next, lp_cfg.enabled ? llama_get_logits_ith(ctx, 0) : nullptr))
+                break;
+            n_past += 1;
+            id_last = next;
+            continue;
         }
-        auto flush_rout = reasoning_ex.flush();
-        if (!flush_rout.reasoning.empty()) {
-            sink.on_reasoning_delta(choice_index, flush_rout.reasoning);
-            reasoning_text += flush_rout.reasoning;
+
+        /* 2. Build target batch: [id_last, draft0, ..., draftN-1]. */
+        std::vector<int> spec_i_batch;
+        spec_i_batch.reserve(draft.size() + 1);
+        common_batch_clear(sbatch);
+        spec_i_batch.push_back(sbatch.n_tokens);
+        common_batch_add(sbatch, id_last, n_past, {0}, /*logits=*/true);
+        for (size_t i = 0; i < draft.size(); ++i) {
+            spec_i_batch.push_back(sbatch.n_tokens);
+            common_batch_add(sbatch, draft[i],
+                             n_past + static_cast<llama_pos>(i) + 1, {0}, /*logits=*/true);
         }
-        emit_content(flush_rout.content);
-        if (!reasoning_text.empty()) sink.on_reasoning_end(choice_index);
+
+        /* 3. Target decode. */
+        if (llama_decode(ctx, sbatch) != 0)
+            throw_backend("llama_decode failed during MTP generation");
+
+        /* 4. Mirror target hidden states into the draft context. */
+        if (!common_speculative_process(spec, sbatch))
+            throw_backend("common_speculative_process failed");
+
+        /* 5. Verify draft against the target via the raw sampler chain. */
+        auto accepted = helix_sample_and_accept_n(sampler, ctx, spec_i_batch, draft);
+
+        /* 6. KV cleanup: remove rejected draft positions. The last accepted
+         *    token is only sampled (not decoded) so it stays out of the KV
+         *    and becomes id_last for the next iteration. */
+        llama_memory_seq_rm(llama_get_memory(ctx), 0,
+                            n_past + static_cast<llama_pos>(accepted.size()), -1);
+
+        /* 7. Inform the manager how many drafts were accepted. */
+        common_speculative_accept(spec, /*seq_id=*/0,
+                                  static_cast<uint16_t>(accepted.size() - 1));
+
+        /* 8. Emit each accepted token. */
+        bool stop = false;
+        for (size_t i = 0; i < accepted.size() && !stop; ++i) {
+            const float* tk_logits = lp_cfg.enabled
+                ? llama_get_logits_ith(ctx, spec_i_batch[i]) : nullptr;
+            stop = emitter.push(accepted[i], tk_logits);
+        }
+        if (stop) break;
+
+        /* 9. Advance. */
+        n_past  += static_cast<llama_pos>(accepted.size());
+        id_last  = accepted.back();
     }
 
-    int reasoning_tokens = 0;
-    if (!reasoning_text.empty()) {
-        reasoning_tokens = static_cast<int>(
-            common_tokenize(ctx, reasoning_text, /*add_special=*/false,
-                            /*parse_special=*/false).size());
-    }
-
-    return {std::move(output), finish_reason, n_predicted, reasoning_tokens, cancelled,
-            std::move(gen_tokens), std::move(logprob_entries)};
+    return emitter.finish();
 }
 /* ------------------------------------------------------------------ */
+
+/* Renders `messages` with the request's stops, tools and tool_choice. Every
+ * path that tokenizes a request goes through here: count_tokens must render
+ * exactly as the chat path does. response_format disables thinking — the
+ * grammar constrains output directly, and a thinking preamble would exhaust
+ * the token budget. */
+static RenderResult render_for_request(const Session& sess, const ChatRequest& req,
+                                       const std::vector<Message>& messages) {
+    const bool has_rf = req.response_format && req.response_format->type != "text";
+    return render_prompt(messages, req.stop, sess.model().chat_templates(),
+                         req.tools, req.tool_choice, req.parallel_tool_calls,
+                         /*enable_thinking=*/!has_rf,
+                         sess.model().options().reasoning_format);
+}
+
+/* Number of leading system/developer messages (the prefix context shift
+ * never evicts). */
+static size_t leading_system_count(const std::vector<Message>& msgs) {
+    size_t n = 0;
+    while (n < msgs.size() &&
+           (msgs[n].role == "system" || msgs[n].role == "developer")) {
+        ++n;
+    }
+    return n;
+}
 
 helix_status_t run_chat_completions(Session& sess,
                                      const char* request_json,
@@ -958,18 +824,14 @@ helix_status_t run_chat_completions(Session& sess,
     }
 
     /* 3. Model alias check. */
-    if (req.model != sess.model().alias()) {
-        throw Error(HELIX_E_MODEL_NOT_FOUND,
-                    "model '" + req.model + "' not loaded in this session",
-                    "model_not_found", "model", "helix_e_model_not_found");
-    }
+    sess.require_model_alias(req.model);
 
     /* 4. Multimodal capability check: reject vision/audio if model has no mmproj. */
     bool has_multimodal_content = false;
     for (const auto& msg : req.messages) {
         if (msg.content_parts.empty()) continue;
         for (const auto& part : msg.content_parts) {
-            if (part.type == "image_url" || part.type == "input_audio") {
+            if (part.is_media()) {
                 has_multimodal_content = true;
                 if (!sess.model().mmproj()) {
                     throw_unsupported(
@@ -1004,17 +866,10 @@ helix_status_t run_chat_completions(Session& sess,
         throw_unsupported("n > 1 is not supported with context_shift", "n");
     }
 
-    /* 5. Render prompt (with tools if present).
-     * Disable thinking for response_format requests — the grammar constrains
-     * output directly, and thinking preamble would exhaust the token budget. */
+    /* 5. Render prompt (with tools if present). */
     const bool has_rf = req.response_format &&
                         req.response_format->type != "text";
-    const std::string& reasoning_fmt = sess.model().options().reasoning_format;
-    RenderResult rendered = render_prompt(
-        req.messages, req.stop, sess.model().chat_templates(),
-        req.tools, req.tool_choice, req.parallel_tool_calls,
-        /*enable_thinking=*/!has_rf,
-        reasoning_fmt);
+    RenderResult rendered = render_for_request(sess, req, req.messages);
 
     /* 6. Tokenise (text-only path) or multimodal prefill. */
     llama_context* ctx = sess.ctx();
@@ -1030,14 +885,21 @@ helix_status_t run_chat_completions(Session& sess,
         for (const auto& msg : req.messages) {
             if (msg.content_parts.empty()) continue;
             for (const auto& part : msg.content_parts) {
-                if (part.type == "image_url" || part.type == "input_audio") {
-                    all_media.push_back(part.media_raw);
+                if (part.is_media()) {
+                    all_media.push_back(part.media_file_uri.empty()
+                                            ? part.media_raw
+                                            : load_file_uri(part.media_file_uri));
                 }
             }
         }
 
         /* Clear KV for seq 0 before multimodal prefill — eval_media starts at
-         * n_past=0 and the KV may still hold state from a prior request. */
+         * n_past=0 and the KV may still hold state from a prior request.
+         * Invalidate the prefix cache first: if eval_media throws (corrupt
+         * media, marker mismatch), the KV no longer holds the prior
+         * conversation and a stale last_tokens_ would make the next text
+         * request reuse cells that are gone. */
+        sess.set_last_tokens({});
         {
             llama_memory_t mem = llama_get_memory(ctx);
             llama_memory_seq_rm(mem, 0, 0, -1);
@@ -1066,8 +928,7 @@ helix_status_t run_chat_completions(Session& sess,
             llama_memory_t mem = llama_get_memory(ctx);
             llama_memory_seq_rm(mem, 0, 0, -1);
             sess.set_last_tokens({});
-            throw Error(HELIX_E_CANCELLED, "cancelled during multimodal prefill",
-                        "cancel", "", "helix_e_cancelled");
+            throw_cancelled("cancelled during multimodal prefill");
         }
     } else {
         prompt_tokens = common_tokenize(
@@ -1094,12 +955,7 @@ helix_status_t run_chat_completions(Session& sess,
             const int n_prompt_orig = n_prompt;
             std::vector<Message> msgs = req.messages;
 
-            size_t sys_end = 0;
-            while (sys_end < msgs.size() &&
-                   (msgs[sys_end].role == "system" ||
-                    msgs[sys_end].role == "developer")) {
-                ++sys_end;
-            }
+            const size_t sys_end = leading_system_count(msgs);
             auto last_user_idx = [&msgs, sys_end]() -> size_t {
                 for (size_t i = msgs.size(); i-- > sys_end; ) {
                     if (msgs[i].role == "user") return i;
@@ -1122,10 +978,7 @@ helix_status_t run_chat_completions(Session& sess,
                 msgs.erase(msgs.begin() + sys_end, msgs.begin() + erase_end);
                 prefill_truncated = true;
 
-                rendered = render_prompt(
-                    msgs, req.stop, sess.model().chat_templates(),
-                    req.tools, req.tool_choice, req.parallel_tool_calls,
-                    /*enable_thinking=*/!has_rf, reasoning_fmt);
+                rendered = render_for_request(sess, req, msgs);
                 prompt_tokens = common_tokenize(
                     ctx, rendered.prompt, /*add_special=*/true,
                     /*parse_special=*/true);
@@ -1133,19 +986,12 @@ helix_status_t run_chat_completions(Session& sess,
             }
 
             if (n_prompt >= n_ctx_size) {
-                {
-                    Error ctx_err(HELIX_E_CONTEXT_FULL,
-                            "context_shift could not make the request fit: "
-                            "the system prompt + latest user message occupy " +
-                            std::to_string(n_prompt) + " of " +
-                            std::to_string(n_ctx_size) + " context tokens",
-                            "context_length_exceeded", "messages",
-                            "helix_e_context_full");
-                    /* helix ABI 1.7: surface the actual token counts. */
-                    ctx_err.requested = n_prompt;
-                    ctx_err.limit     = n_ctx_size;
-                    throw ctx_err;
-                }
+                throw_context_full(n_prompt, n_ctx_size,
+                                   "context_shift could not make the request fit: "
+                                   "the system prompt + latest user message occupy " +
+                                   std::to_string(n_prompt) + " of " +
+                                   std::to_string(n_ctx_size) + " context tokens",
+                                   "messages");
             }
             if (prefill_truncated) {
                 prefill_evicted = n_prompt_orig - n_prompt;
@@ -1259,18 +1105,14 @@ helix_status_t run_chat_completions(Session& sess,
         shift_cfg.enabled = true;
         shift_cfg.n_ctx   = n_ctx_size;
         int n_keep = llama_vocab_get_add_bos(vocab) ? 1 : 0;
-        size_t sys_end = 0;
-        while (sys_end < req.messages.size() &&
-               (req.messages[sys_end].role == "system" ||
-                req.messages[sys_end].role == "developer")) {
-            ++sys_end;
-        }
+        const size_t sys_end = leading_system_count(req.messages);
         if (sys_end > 0) {
             RenderResult sys_r = render_prompt(
                 std::vector<Message>(req.messages.begin(),
                                      req.messages.begin() + sys_end),
                 {}, sess.model().chat_templates(),
-                {}, {}, true, /*enable_thinking=*/!has_rf, reasoning_fmt);
+                {}, {}, true, /*enable_thinking=*/!has_rf,
+                sess.model().options().reasoning_format);
             const std::vector<llama_token> sys_toks = common_tokenize(
                 sess.ctx(), sys_r.prompt, /*add_special=*/true,
                 /*parse_special=*/true);
@@ -1280,7 +1122,12 @@ helix_status_t run_chat_completions(Session& sess,
     }
 
 
-    /* 10. Run completions. */
+    /* 10. Run completions. From here on the KV is mutated; drop the prefix
+     * cache now so an exception mid-decode (backend failure, sink throw,
+     * OOM) leaves last_tokens_ empty rather than describing stale KV. Step
+     * 12 re-establishes it on success. */
+    sess.set_last_tokens({});
+
     int  total_completion_tokens = 0;
     int  total_reasoning_tokens  = 0;
     bool any_cancelled           = false;
@@ -1289,17 +1136,31 @@ helix_status_t run_chat_completions(Session& sess,
     std::vector<llama_token> last_gen_tokens;
     std::vector<llama_token> shifted_cache;
 
+    /* Runtime "deterministic": requests that omit "seed" behave as seed 0. */
+    std::optional<uint32_t> base_seed = req.seed;
+    if (!base_seed && sess.model().runtime().options().deterministic) {
+        base_seed = 0u;
+    }
+
     for (int run = 0; run < n_choices; ++run) {
         /* For multimodal, prefill is already done; skip text prefill in decode_one.
          * For subsequent choices (run > 0), we can't re-run multimodal prefill cheaply,
          * so multimodal requests are effectively n=1. */
         const bool skip_prefill = multimodal_prefill_done && (run == 0);
-        const size_t run_lcp    = (run == 0 && !multimodal_prefill_done) ? lcp : 0;
+        /* Later choices reuse the prompt KV the first choice left behind:
+         * keep [0, n_prompt - 1) and re-decode only the last prompt token to
+         * regenerate its logits. decode_one falls back to a full re-prefill
+         * if the memory cannot be partially removed. */
+        size_t run_lcp = 0;
+        if (!multimodal_prefill_done) {
+            if (run == 0)          run_lcp = lcp;
+            else if (n_prompt > 0) run_lcp = static_cast<size_t>(n_prompt - 1);
+        }
 
-        unsigned int run_seed = 0;
-        if (req.seed) {
-            run_seed = static_cast<unsigned int>(
-                (*req.seed * 2654435761u) ^ static_cast<unsigned int>(run));
+        std::optional<uint32_t> run_seed;
+        if (base_seed) {
+            run_seed = static_cast<uint32_t>(
+                (*base_seed * 2654435761u) ^ static_cast<unsigned int>(run));
         }
 
         SamplerPtr sampler = build_sampler_chain(req, run_seed, vocab,
@@ -1424,12 +1285,7 @@ helix_status_t run_chat_completions(Session& sess,
 
     /* 13. Serialise non-streaming response. */
     if (!streaming && out_response_json) {
-        std::string json_str = response.to_json();
-        /* Allocated with C malloc() so the caller frees it via helix_free()
-         * (which calls free()). Keep these two paired — see helix_free(). */
-        *out_response_json = static_cast<char*>(malloc(json_str.size() + 1));
-        if (!*out_response_json) throw std::bad_alloc();
-        std::copy_n(json_str.c_str(), json_str.size() + 1, *out_response_json);
+        *out_response_json = dup_for_caller(response.to_json());
     }
 
     return HELIX_OK;
@@ -1445,17 +1301,13 @@ helix_status_t run_count_tokens(Session& sess,
     ChatRequest req = ChatRequest::from_json(request_json ? request_json : "");
     req.validate();
 
-    if (req.model != sess.model().alias()) {
-        throw Error(HELIX_E_MODEL_NOT_FOUND,
-                    "model '" + req.model + "' not loaded in this session",
-                    "model_not_found", "model", "helix_e_model_not_found");
-    }
+    sess.require_model_alias(req.model);
 
     /* v1 limitation: media patch-token counting needs the projector; reject
      * honestly rather than report a text-only count that undercounts. */
     for (const auto& msg : req.messages) {
         for (const auto& part : msg.content_parts) {
-            if (part.type == "image_url" || part.type == "input_audio") {
+            if (part.is_media()) {
                 throw_unsupported(
                     "helix_count_tokens does not support image/audio content parts",
                     "messages");
@@ -1463,15 +1315,7 @@ helix_status_t run_count_tokens(Session& sess,
         }
     }
 
-    /* Mirror run_chat_completions: response_format disables thinking, and
-     * the model's reasoning_format shapes the rendered prompt. */
-    const bool has_rf = req.response_format &&
-                        req.response_format->type != "text";
-    RenderResult rendered = render_prompt(
-        req.messages, req.stop, sess.model().chat_templates(),
-        req.tools, req.tool_choice, req.parallel_tool_calls,
-        /*enable_thinking=*/!has_rf,
-        sess.model().options().reasoning_format);
+    RenderResult rendered = render_for_request(sess, req, req.messages);
 
     const std::vector<llama_token> toks = common_tokenize(
         sess.ctx(), rendered.prompt, /*add_special=*/true, /*parse_special=*/true);
