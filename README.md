@@ -257,8 +257,8 @@ helix/
 │   ├── helix-doctor/        # Diagnostic CLI
 │   └── helix-shim-server/   # HTTP shim server for testing
 └── third_party/
-    ├── llama.cpp/           # Vendored inference engine (pinned)
-    └── nlohmann_json.hpp    # Vendored JSON library
+    ├── llama.cpp/           # Inference engine: the anemoi-ai fork, a submodule (also supplies nlohmann/json)
+    └── llama.cpp.commit     # The pinned llama.cpp commit, for trees with no git metadata
 ```
 
 ---
