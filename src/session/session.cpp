@@ -377,6 +377,9 @@ void Session::init_on_context(const llama_context_params& ctx_params,
             dft_params.n_gpu_layers = model_.n_gpu_layers_actual();
             dft_params.load_mode    = load_mode_from(model_.options().use_mmap,
                                                      model_.options().use_mlock);
+            /* The draft file is an MTP model: its layers are the point. */
+            dft_params.load_mtp     = true;
+            dft_params.lazy_mode    = LLAMA_LAZY_MODE_OFF;
             model_.apply_device_preference(dft_params);
             log_info("loading MTP draft model: "
                      + opts_.speculative.draft_model_path);
@@ -523,14 +526,13 @@ void Session::maybe_run_warmup() {
             run_embed_warmup(*this);
         } else {
             run_warmup(ctx_, model_.n_vocab());
-            /* JIT the MTP head graph so the first speculative request does not
-             * pay the graph-build cost. Safe to skip on failure. */
-            if (ctx_mtp_) {
-                try { run_warmup(ctx_mtp_, model_.n_vocab()); }
-                catch (const std::exception& e) {
-                    log_warn("MTP context warmup skipped: " + std::string(e.what()));
-                }
-            }
+            /* No warmup of the MTP context. It used to get the same dummy-token
+             * decode, to JIT its graph before the first speculative request.
+             * Since llama.cpp b12033 an MTP graph reads the target's hidden
+             * state for every token, and a plain batch carries none: the decode
+             * dies on a GGML_ASSERT ("this graph requires a state embedding"),
+             * which aborts the process, so no try/catch here can contain it.
+             * The first speculative request pays the graph build instead. */
         }
         warmup_done_.store(true, std::memory_order_relaxed);
     } catch (...) {
