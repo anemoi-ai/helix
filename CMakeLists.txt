@@ -61,12 +61,53 @@ set(MTMD_VIDEO           OFF CACHE BOOL "" FORCE)  # Helix does not expose video
 add_subdirectory(third_party/llama.cpp EXCLUDE_FROM_ALL)
 
 # ------------------------------------------------------------------
-#  Read pinned commit SHA for version string
+#  llama.cpp commit SHA for the version string
 # ------------------------------------------------------------------
-file(READ "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp.commit"
-     HELIX_LLAMACPP_SHA_RAW)
-string(STRIP "${HELIX_LLAMACPP_SHA_RAW}" HELIX_LLAMACPP_SHA)
+# The version string must name the llama.cpp that is actually compiled, so
+# the source of truth is the submodule's checked-out HEAD. The marker file
+# third_party/llama.cpp.commit is the fallback for trees with no git metadata
+# (source tarballs, packaging). Until 2026-11 the marker was the only source
+# and had gone stale: it named the first fork patch while the submodule sat
+# two commits later, so helix_version_string() reported a llama.cpp that was
+# not the one built. CI's llama-pin job keeps the marker equal to the gitlink.
+set(_helix_marker "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp.commit")
+file(READ "${_helix_marker}" _helix_marker_raw)
+string(STRIP "${_helix_marker_raw}" _helix_marker_sha)
+set(HELIX_LLAMACPP_SHA "${_helix_marker_sha}")
+
+find_package(Git QUIET)
+if(GIT_FOUND)
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" -C "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp"
+                rev-parse HEAD --absolute-git-dir
+        OUTPUT_VARIABLE _helix_git_out
+        RESULT_VARIABLE _helix_git_rc
+        ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(_helix_git_rc EQUAL 0)
+        string(REPLACE "\n" ";" _helix_git_out "${_helix_git_out}")
+        list(GET _helix_git_out 0 _helix_head_sha)
+        list(GET _helix_git_out 1 _helix_head_gitdir)
+        # Inside a plain (non-submodule) helix checkout without llama.cpp
+        # populated, rev-parse answers for the *parent* repo; only trust it
+        # when the git dir is the submodule's own.
+        if(_helix_head_gitdir MATCHES "llama\\.cpp$")
+            set(HELIX_LLAMACPP_SHA "${_helix_head_sha}")
+            # Re-configure when the submodule moves, or the string goes stale
+            # in an existing build tree.
+            set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                         "${_helix_head_gitdir}/HEAD")
+            if(NOT _helix_head_sha STREQUAL _helix_marker_sha)
+                message(WARNING
+                    "third_party/llama.cpp is at ${_helix_head_sha} but "
+                    "third_party/llama.cpp.commit says ${_helix_marker_sha}. "
+                    "The version string uses the checkout; update the marker "
+                    "before committing a pin change.")
+            endif()
+        endif()
+    endif()
+endif()
 string(SUBSTRING "${HELIX_LLAMACPP_SHA}" 0 12 HELIX_LLAMACPP_SHA_SHORT)
+message(STATUS "helix: llama.cpp ${HELIX_LLAMACPP_SHA_SHORT}")
 
 # ------------------------------------------------------------------
 #  Platform-specific CPU probe source

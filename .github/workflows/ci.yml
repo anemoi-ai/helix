@@ -8,6 +8,30 @@ on:
 
 jobs:
   # --------------------------------------------------------------- #
+  #  The llama.cpp marker names the pinned submodule commit          #
+  # --------------------------------------------------------------- #
+  # third_party/llama.cpp.commit is what a source tarball's version
+  # string reports. It went stale once (it named the first fork patch
+  # while the submodule was two commits later), and nothing noticed.
+  # Reads the gitlink from the tree, so no submodule fetch is needed.
+  llama-pin:
+    name: llama.cpp marker matches the submodule
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare marker with gitlink
+        shell: bash
+        run: |
+          pinned=$(git ls-tree HEAD third_party/llama.cpp | awk '{print $3}')
+          marker=$(tr -d '[:space:]' < third_party/llama.cpp.commit)
+          echo "gitlink: $pinned"
+          echo "marker:  $marker"
+          if [ "$pinned" != "$marker" ]; then
+            echo "::error file=third_party/llama.cpp.commit::marker says $marker but the submodule is pinned at $pinned. Run: git ls-tree HEAD third_party/llama.cpp | awk '{print \$3}' > third_party/llama.cpp.commit"
+            exit 1
+          fi
+
+  # --------------------------------------------------------------- #
   #  Build + unit tests + integration tests (fast, most coverage)   #
   # --------------------------------------------------------------- #
   test:
