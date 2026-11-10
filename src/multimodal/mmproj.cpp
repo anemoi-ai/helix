@@ -1,4 +1,6 @@
 #include "mmproj.hpp"
+
+#include <cstring>
 #include "../internal/error.hpp"
 #include "../internal/log.hpp"
 #include "image_decode.hpp"
@@ -73,7 +75,8 @@ llama_pos MmProj::eval_media(
          * Helix passes placeholder=false (it needs real decoded media) and frees
          * any video_ctx — it is only populated for video inputs, which Helix does
          * not expose (and MTMD_VIDEO is built OFF), but handle it defensively. */
-        auto wrapper = mtmd_helper_bitmap_init_from_buf(ctx_, raw.data(), raw.size(), false);
+        auto wrapper = mtmd_helper_bitmap_init_from_buf(ctx_, raw.data(), raw.size(), false,
+                                                        mtmd_helper_init_opt_default());
         if (wrapper.video_ctx) {
             mtmd_helper_video_free(wrapper.video_ctx);
             wrapper.video_ctx = nullptr;
@@ -92,8 +95,13 @@ llama_pos MmProj::eval_media(
                                          decltype(&mtmd_input_chunks_free)>(
         chunks, &mtmd_input_chunks_free);
 
-    mtmd_input_text text_input;
+    /* Value-initialised, and every field set: llama.cpp b12033 added
+     * text_len, and mtmd reads exactly that many bytes (no strlen). Left
+     * uninitialised it is stack garbage: a huge value throws bad_alloc
+     * inside mtmd_tokenize, a wrong one reads past the prompt. */
+    mtmd_input_text text_input{};
     text_input.text          = prompt_with_markers;
+    text_input.text_len      = std::strlen(prompt_with_markers);
     text_input.add_special   = add_special;
     text_input.parse_special = true;
 
@@ -114,6 +122,30 @@ llama_pos MmProj::eval_media(
         throw_validation("mtmd_tokenize failed (code " + std::to_string(tok_res) +
                          "); check that the number of media parts matches markers in the prompt",
                          "messages");
+    }
+
+    /* A media chunk decoded with non-causal attention must fit in one ubatch;
+     * past that, llama.cpp's decode is a GGML_ASSERT ("non-causal attention
+     * requires n_ubatch >= n_tokens"), which aborts the process. It used to be
+     * unreachable for Gemma 4 (images came to <= 268 tokens); llama.cpp b12033
+     * stopped letterbox-padding its images (#30922) and a 1344x1008 image now
+     * costs 588 tokens. Refuse it here, as a request error, instead. */
+    {
+        const uint32_t n_ubatch = llama_n_ubatch(lctx);
+        const size_t n_chunks = mtmd_input_chunks_size(chunks);
+        for (size_t i = 0; i < n_chunks; ++i) {
+            const mtmd_input_chunk* chunk = mtmd_input_chunks_get(chunks, i);
+            if (mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_TEXT) continue;
+            if (!mtmd_decode_use_non_causal(ctx_, chunk)) continue;
+            const size_t n_tok = mtmd_input_chunk_get_n_tokens(chunk);
+            if (n_tok > n_ubatch) {
+                throw_validation("a media part needs " + std::to_string(n_tok) +
+                                 " tokens in one batch, more than this session's n_ubatch (" +
+                                 std::to_string(n_ubatch) + "); send a smaller image or "
+                                 "create the session with a larger n_ubatch",
+                                 "messages");
+            }
+        }
     }
 
     /* Eval all chunks into the llama context. */

@@ -159,10 +159,15 @@ RenderResult render_prompt(const std::vector<Message>& messages,
     common_chat_params params = common_chat_templates_apply(tmpls, inputs);
 
     RenderResult result;
-    result.prompt            = params.prompt;
+    /* The prompt is a list of parts now (template text vs user input). It is
+     * still tokenized whole, as one string, exactly as before the bump;
+     * tokenizing it part by part is the D2 change, kept out of this one. */
+    result.prompt            = params.prompt.str();
     result.supports_thinking = params.supports_thinking;
     result.thinking_start_tag = params.thinking_start_tag;
-    result.thinking_end_tag  = params.thinking_end_tag;
+    result.thinking_end_tags = params.thinking_end_tags;
+    result.thinking_end_tag  = params.thinking_end_tags.empty()
+        ? std::string{} : params.thinking_end_tags.front();
     result.extract_reasoning = (rf_enum != COMMON_REASONING_FORMAT_NONE);
 
     /* Some templates (Qwen3 thinking mode) pre-open the think block in the
@@ -195,7 +200,8 @@ RenderResult render_prompt(const std::vector<Message>& messages,
     if (use_tools && !params.grammar.empty()) {
         result.grammar         = params.grammar;
         result.grammar_lazy    = params.grammar_lazy;
-        result.parser_data     = params.parser;
+        if (!params.parser.empty())
+            result.parser = std::make_shared<const common_peg_arena>(params.parser);
         result.generation_prompt = params.generation_prompt;
         result.chat_format     = static_cast<int>(params.format);
         result.has_tools       = true;
@@ -209,7 +215,7 @@ RenderResult render_prompt(const std::vector<Message>& messages,
         }
     } else if (use_tools && !params.parser.empty()) {
         /* Parser without explicit grammar (autoparser-only path). */
-        result.parser_data       = params.parser;
+        result.parser            = std::make_shared<const common_peg_arena>(params.parser);
         result.generation_prompt = params.generation_prompt;
         result.chat_format       = static_cast<int>(params.format);
         result.has_tools         = true;

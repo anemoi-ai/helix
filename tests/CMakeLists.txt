@@ -59,6 +59,7 @@ add_executable(helix_unit_tests
     unit/rerank_request_test.cpp
     unit/embed_packing_test.cpp
     unit/speculative_options_test.cpp
+    unit/llama_bump_test.cpp
     # Internal sources needed for symbol access:
     ${CMAKE_SOURCE_DIR}/src/session/options.cpp
     ${CMAKE_SOURCE_DIR}/src/json/request.cpp
@@ -88,6 +89,10 @@ target_compile_definitions(helix_unit_tests PRIVATE
 )
 target_compile_definitions(helix_unit_tests PRIVATE
     HELIX_LLAMACPP_SHA="test"
+)
+# llama_bump_test reads chat templates from the pinned llama.cpp tree.
+target_compile_definitions(helix_unit_tests PRIVATE
+    HELIX_LLAMACPP_TEMPLATES="${CMAKE_SOURCE_DIR}/third_party/llama.cpp/models/templates"
 )
 if(WIN32)
     target_compile_definitions(helix_unit_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)

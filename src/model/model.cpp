@@ -1,4 +1,5 @@
 #include "model.hpp"
+#include "load_mode.hpp"
 #include "../runtime/runtime.hpp"
 #include "../hardware/gpu_layer_select.hpp"
 #include "../multimodal/mmproj.hpp"
@@ -215,7 +216,7 @@ Model::Model(Runtime& rt, const ModelOptions& opts,
     int total_layers = 0;
     int training_ctx = 0;
     {
-        gguf_init_params gparams;
+        gguf_init_params gparams{};  /* value-initialised: a field added upstream starts zeroed */
         gparams.no_alloc = true;
         gparams.ctx      = nullptr;
         gguf_context* gctx = gguf_init_from_file(opts.model_path.c_str(), gparams);
@@ -284,8 +285,17 @@ Model::Model(Runtime& rt, const ModelOptions& opts,
     // ------------------------------------------------------------------
     auto params         = llama_model_default_params();
     params.n_gpu_layers = n_gpu_layers_actual_;
-    params.use_mmap     = opts.use_mmap;
-    params.use_mlock    = opts.use_mlock;
+    params.load_mode    = load_mode_from(opts.use_mmap, opts.use_mlock);
+    /* Load MTP/NextN layers, as llama.cpp did unconditionally before #26296
+     * (b12033 made them opt-in, default off). helix decides on speculation
+     * per session, after the model is loaded, and a draft-mtp session on a
+     * model loaded without its MTP block aborts the process
+     * (GGML_ASSERT "MTP block missing nextn.eh_proj"). No-op for models
+     * without MTP layers. */
+    params.load_mtp     = true;
+    /* b12033 also added lazy_mode, default AUTO (on-demand rows for marked
+     * tensors over 4 GiB). Before it, every tensor was read up front. */
+    params.lazy_mode    = LLAMA_LAZY_MODE_OFF;
     params.vocab_only   = opts.vocab_only;
     apply_device_preference(params);
 

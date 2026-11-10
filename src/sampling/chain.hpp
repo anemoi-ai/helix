@@ -37,7 +37,12 @@ SamplerPtr build_sampler_chain(const ChatRequest& req,
                                 int reasoning_budget = -1,
                                 const std::string& thinking_start_tag = "",
                                 const std::string& thinking_end_tag = "",
-                                bool thinking_forced_open = false);
+                                bool thinking_forced_open = false,
+                                /* Every end tag the template accepts (RenderResult::
+                                 * thinking_end_tags). The budget ends naturally on any of
+                                 * them; thinking_end_tag is the one forced. Empty means
+                                 * thinking_end_tag alone. */
+                                const std::vector<std::string>& thinking_end_tags = {});
 
 /* Speculative-decoding verification: sample one token at each batch position
  * in `idxs`, accepting draft tokens that match the target's choice. Returns

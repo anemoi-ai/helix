@@ -1,5 +1,6 @@
 #include "embed_loop.hpp"
 #include "embed_packing.hpp"
+#include "llama_batch_util.hpp"
 #include "../session/session.hpp"
 #include "../model/model.hpp"
 #include "../json/request.hpp"
@@ -131,13 +132,13 @@ void run_packed_flushes(Session& sess,
             throw_cancelled("request cancelled");
         }
 
-        common_batch_clear(batch);
+        batch_clear(batch);
         for (size_t s = 0; s < group.size(); ++s) {
             const auto& t = toks[group[s]];
             for (size_t p = 0; p < t.size(); ++p) {
                 /* All tokens marked for output: with graph-side pooling the
                  * per-token outputs feed the pooled vector. */
-                common_batch_add(batch, t[p], static_cast<llama_pos>(p),
+                batch_add(batch, t[p], static_cast<llama_pos>(p),
                                  {static_cast<llama_seq_id>(s)}, true);
             }
         }
@@ -348,7 +349,7 @@ void run_embed_warmup(Session& sess) {
 
     llama_batch batch = llama_batch_init(1, /*embd=*/0, 1);
     BatchGuard guard(batch);
-    common_batch_add(batch, tok, 0, {0}, true);
+    batch_add(batch, tok, 0, {0}, true);
 
     const int32_t rc = run_one_batch(sess, batch);
     /* Clear KV so the warmup doesn't pollute the first real request. */
